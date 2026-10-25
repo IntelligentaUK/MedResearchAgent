@@ -1445,6 +1445,43 @@ impl<'a> HypothesisValidationAgent<'a> {
             ));
         }
 
+        // Sources that may only be quoted must not be copied into the assessment's prose.
+        let mut narrative: Vec<&str> = vec![
+            &assessment.summary,
+            &assessment.can_conclude,
+            &assessment.cannot_conclude,
+            &assessment.would_change_assessment,
+            &assessment.next_test,
+        ];
+        narrative.extend(assessment.limitations.iter().map(String::as_str));
+        for claim in &assessment.claims {
+            narrative.push(&claim.rationale);
+            narrative.extend(claim.citations.iter().map(|c| c.interpretation.as_str()));
+        }
+        for rec in &assessment.evidence {
+            narrative.extend([
+                rec.stance.as_str(),
+                rec.design.as_str(),
+                rec.population.as_str(),
+                rec.sample_size.as_str(),
+                rec.exposure_comparator_outcome.as_str(),
+                rec.follow_up.as_str(),
+                rec.effect.as_str(),
+                rec.uncertainty.as_str(),
+                rec.analysis_status.as_str(),
+                rec.cohort_overlap.as_str(),
+            ]);
+            narrative.extend(rec.limitations.iter().map(String::as_str));
+        }
+        if let Some(ref rev) = assessment.proposed_revision {
+            narrative.extend([rev.statement.as_str(), rev.explanation.as_str(), rev.next_test.as_str()]);
+        }
+        if let Some(why) = EvidenceValidator::restricted_overlap(&narrative, documents) {
+            return Err(ResearchError::InvalidResponse(format!(
+                "An assessment field {why}. Describe the evidence in your own words and keep exact wording to the citation quotes."
+            )));
+        }
+
         let citation_failure = "An assessment citation is not an exact quote of 20 to 400 characters from the supplied body passage, or its source is missing from the corresponding claim's evidence ledger.";
         for claim in &mut assessment.claims {
             if (claim.verdict.is_supported()
@@ -1911,6 +1948,13 @@ impl<'a> HypothesisConnectionAgent<'a> {
                         };
                         conn.draft =
                             EvidenceValidator::validate_discovery_draft(conn.draft, &documents)?;
+                        if let Some(why) =
+                            EvidenceValidator::restricted_overlap(&[conn.reason.as_str()], &documents)
+                        {
+                            return Err(ResearchError::InvalidResponse(format!(
+                                "A connection reason {why}. Describe the link in your own words."
+                            )));
+                        }
                         let new_ids: HashSet<String> =
                             conn.new_evidence_paper_ids.iter().cloned().collect();
                         let cited_ids: HashSet<String> =

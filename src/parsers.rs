@@ -109,6 +109,38 @@ fn parse_bounded_xml<'a>(text: &'a str, failure: &str) -> Result<Document<'a>, R
     Ok(doc)
 }
 
+/// Most text one collector call gathers from a subtree. Identity, licence and heading
+/// strings are far shorter; this keeps a nested document from costing depth times its size.
+const MAX_COLLECTED_TEXT_BYTES: usize = 8 * 1024 * 1024;
+
+/// Most article text one parser may extract, across all passages: no more than the largest
+/// accepted download, so overlapping markup cannot multiply a response in memory.
+pub const MAX_EXTRACTED_TEXT_BYTES: usize = 24 * 1024 * 1024;
+
+/// Most passages one article may yield.
+pub const MAX_PASSAGES: usize = 50_000;
+
+/// Longest heading, identifier, version or licence string kept from a document.
+const MAX_METADATA_CHARS: usize = 1_000;
+
+fn ensure_extraction_budget(passages: &[Passage]) -> Result<(), ResearchError> {
+    let bytes: usize = passages.iter().map(|p| p.text.len()).sum();
+    if passages.len() > MAX_PASSAGES || bytes > MAX_EXTRACTED_TEXT_BYTES {
+        return Err(ResearchError::InvalidResponse(
+            "The article text exceeds the extraction budget and was not stored.".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn bounded_metadata(text: String) -> String {
+    if text.chars().count() > MAX_METADATA_CHARS {
+        text.chars().take(MAX_METADATA_CHARS).collect()
+    } else {
+        text
+    }
+}
+
 /// The digits of a PMC identifier, with any `PMC` prefix and surrounding space removed.
 fn pmc_digits(value: &str) -> String {
     value.trim().to_uppercase().replace("PMC", "")
@@ -147,7 +179,7 @@ impl ArticleTextParser {
             if name == "article-version"
                 || (name == "article-id" && node.attribute("pub-id-type") == Some("pmcid-ver"))
             {
-                let v = normalized_whitespace(&collect_all_text(node));
+                let v = bounded_metadata(normalized_whitespace(&collect_all_text(node)));
                 if !v.is_empty() {
                     version = Some(v);
                 }
@@ -158,7 +190,7 @@ impl ArticleTextParser {
                         license_url = Some(attr.value().to_string());
                     }
                 }
-                let l = normalized_whitespace(&collect_all_text(node));
+                let l = bounded_metadata(normalized_whitespace(&collect_all_text(node)));
                 if !l.is_empty() {
                     license_text = l;
                 }
@@ -180,6 +212,7 @@ impl ArticleTextParser {
                     .to_string(),
             ));
         }
+        ensure_extraction_budget(&passages)?;
 
         let parsed_license_url = license_url.as_deref().and_then(|u| {
             let parsed = Url::parse(u).ok()?;
@@ -233,7 +266,7 @@ impl ArticleTextParser {
             let title = node
                 .children()
                 .find(|c| c.is_element() && c.tag_name().name() == "title")
-                .map(|t| normalized_whitespace(&collect_jats_text(t, EXCLUDED)))
+                .map(|t| bounded_metadata(normalized_whitespace(&collect_jats_text(t, EXCLUDED))))
                 .unwrap_or_default();
             sections.push(title);
         }
@@ -457,6 +490,7 @@ impl ArticleTextParser {
                     .to_string(),
             ));
         }
+        ensure_extraction_budget(&passages)?;
 
         Ok(ArticleText {
             passages,
@@ -514,12 +548,13 @@ impl ArticleTextParser {
             if !in_meta {
                 continue;
             }
+            let text = || bounded_metadata(collect_all_text(node));
             match node.tag_name().name() {
-                "article-title" => xml_title = collect_all_text(node),
+                "article-title" => xml_title = text(),
                 "article-id" => match node.attribute("pub-id-type") {
-                    Some("doi") => xml_doi = Some(collect_all_text(node)),
-                    Some("pmid") => xml_pmid = Some(collect_all_text(node)),
-                    Some("pmcid") | Some("pmc") => xml_pmcid = Some(collect_all_text(node)),
+                    Some("doi") => xml_doi = Some(text()),
+                    Some("pmid") => xml_pmid = Some(text()),
+                    Some("pmcid") | Some("pmc") => xml_pmcid = Some(text()),
                     _ => {}
                 },
                 _ => {}
@@ -619,19 +654,36 @@ impl ElsevierArticleParser {
             "cross-refs",
         ];
 
-        let mut found_doi: Option<String> = None;
+        // The response must say which article it is before any text is extracted; a body
+        // with no readable DOI is not attached to the requested paper.
+        let found_doi = doc
+            .descendants()
+            .filter(|n| n.is_element() && n.tag_name().name() == "doi")
+            .map(|n| bounded_metadata(collect_all_text(n).trim().to_string()))
+            .find(|d| !d.is_empty());
+        match normalize_doi(found_doi.as_deref()) {
+            Some(found) if Some(found.as_str()) == normalize_doi(Some(doi)).as_deref() => {}
+            Some(found) => {
+                return Err(ResearchError::InvalidResponse(format!(
+                    "The Elsevier TDM response describes a different DOI ({found})."
+                )))
+            }
+            None => {
+                return Err(ResearchError::InvalidResponse(
+                    "The Elsevier TDM response carries no readable DOI, so it cannot be tied to the requested article.".to_string(),
+                ))
+            }
+        }
+
+        let is_paragraph = |n: &Node<'_, '_>| {
+            n.is_element() && matches!(n.tag_name().name(), "para" | "simple-para")
+        };
         let mut passages: Vec<Passage> = Vec::new();
         let mut has_body = false;
         let mut current_section = "Article body".to_string();
 
         for node in doc.descendants().filter(|n| n.is_element()) {
             let tag = node.tag_name().name();
-            if tag == "doi" && found_doi.is_none() {
-                let d = collect_all_text(node).trim().to_string();
-                if !d.is_empty() {
-                    found_doi = Some(d);
-                }
-            }
             if node
                 .ancestors()
                 .filter(|a| a.is_element())
@@ -644,11 +696,16 @@ impl ElsevierArticleParser {
                 .filter(|a| a.is_element())
                 .any(|a| a.tag_name().name() == "abstract");
             if tag == "section-title" && !in_abstract {
-                let title = normalized_whitespace(&collect_all_text(node));
+                let title = bounded_metadata(normalized_whitespace(&collect_all_text(node)));
                 if !title.is_empty() {
                     current_section = title;
                 }
-            } else if tag == "para" || tag == "simple-para" {
+            } else if is_paragraph(&node) {
+                // A paragraph inside a paragraph is already part of its parent's text;
+                // extracting it again would retain the same text once per level.
+                if node.ancestors().skip(1).any(|a| is_paragraph(&a)) {
+                    continue;
+                }
                 let text = normalized_whitespace(&collect_jats_text(node, EXCLUDED));
                 if text.is_empty() {
                     continue;
@@ -668,27 +725,12 @@ impl ElsevierArticleParser {
             }
         }
 
-        // The response must say which article it is; a body with no readable DOI is not
-        // attached to the requested paper.
-        match normalize_doi(found_doi.as_deref()) {
-            Some(found) if Some(found.as_str()) == normalize_doi(Some(doi)).as_deref() => {}
-            Some(found) => {
-                return Err(ResearchError::InvalidResponse(format!(
-                    "The Elsevier TDM response describes a different DOI ({found})."
-                )))
-            }
-            None => {
-                return Err(ResearchError::InvalidResponse(
-                    "The Elsevier TDM response carries no readable DOI, so it cannot be tied to the requested article.".to_string(),
-                ))
-            }
-        }
-
         if !has_body {
             return Err(ResearchError::InvalidResponse(
                 "The Elsevier TDM response contains no article body; the institution may not be entitled to this article's full text. Abstract-only responses are not used as evidence.".to_string(),
             ));
         }
+        ensure_extraction_budget(&passages)?;
 
         Ok(ArticleText {
             passages,
@@ -728,10 +770,14 @@ impl MarkupText {
 /// The text of a node's text descendants, in order. Only text nodes are read: on an element,
 /// `Node::text()` returns its first text child, which would be counted twice.
 fn collect_all_text(node: Node<'_, '_>) -> String {
-    node.descendants()
-        .filter(|d| d.is_text())
-        .filter_map(|d| d.text())
-        .collect()
+    let mut out = String::new();
+    for text in node.descendants().filter(|d| d.is_text()).filter_map(|d| d.text()) {
+        if out.len() >= MAX_COLLECTED_TEXT_BYTES {
+            break;
+        }
+        out.push_str(text);
+    }
+    out
 }
 
 fn collect_jats_text(node: Node<'_, '_>, excluded: &[&str]) -> String {
@@ -749,7 +795,9 @@ fn collect_jats_text(node: Node<'_, '_>, excluded: &[&str]) -> String {
         }
         if n.is_text() {
             if let Some(t) = n.text() {
-                out.push_str(t);
+                if out.len() < MAX_COLLECTED_TEXT_BYTES {
+                    out.push_str(t);
+                }
             }
             return;
         }

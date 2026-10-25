@@ -1,9 +1,10 @@
 use crate::catalog::{ResearchSourceCatalog, WIDER_CORPUS_PAGE_SIZE};
 use crate::dedup::PaperDeduplicator;
 use crate::models::{
-    normalize_doi, ArticleText, FullTextLocation, InstitutionalAccess, Paper, ResearchDomain,
-    ResearchError, TdmPublisher,
+    normalize_doi, strip_url_capability, ArticleText, FullTextLocation, InstitutionalAccess,
+    Paper, ResearchDomain, ResearchError, TdmPublisher,
 };
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use crate::parsers::{
     ArticleTextParser, ElsevierArticleParser, MarkupText, AUTHOR_MANUSCRIPT_LICENSE,
 };
@@ -852,7 +853,69 @@ pub fn tdm_destination_allowed(url: &Url) -> bool {
         && matches!(url.port(), None | Some(443))
         && url.username().is_empty()
         && url.password().is_none()
-        && matches!(url.host(), Some(url::Host::Domain(d)) if !d.is_empty() && !d.ends_with('.'))
+        && matches!(url.host(), Some(url::Host::Domain(d))
+            if !d.is_empty()
+                && !d.ends_with('.')
+                && !d.eq_ignore_ascii_case("localhost")
+                && !d.to_ascii_lowercase().ends_with(".localhost"))
+}
+
+/// Whether an address is on the public internet rather than this host, a private network,
+/// a link-local segment or a reserved range. A DNS name a publisher redirects to may
+/// resolve anywhere, so every answer is checked before it is connected to.
+pub fn is_public_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => is_public_ipv4(v4),
+        IpAddr::V6(v6) => {
+            if let Some(mapped) = v6.to_ipv4_mapped() {
+                return is_public_ipv4(mapped);
+            }
+            let segments = v6.segments();
+            !(v6.is_unspecified()
+                || v6.is_loopback()
+                || v6.is_multicast()
+                || (segments[0] & 0xfe00) == 0xfc00 // fc00::/7 unique local
+                || (segments[0] & 0xffc0) == 0xfe80 // fe80::/10 link local
+                || (segments[0] == 0x2001 && segments[1] == 0x0db8) // documentation
+                || (segments[0] == 0x0064 && segments[1] == 0xff9b) // NAT64 well-known prefix
+                || v6 == Ipv6Addr::new(0, 0, 0, 0, 0, 0xffff, 0, 0))
+        }
+    }
+}
+
+fn is_public_ipv4(ip: Ipv4Addr) -> bool {
+    let [a, b, _, _] = ip.octets();
+    !(ip.is_unspecified()
+        || ip.is_loopback()
+        || ip.is_private()
+        || ip.is_link_local()
+        || ip.is_broadcast()
+        || ip.is_documentation()
+        || ip.is_multicast()
+        || a == 0
+        || (a == 100 && (64..=127).contains(&b)) // 100.64.0.0/10 shared address space
+        || (a == 192 && b == 0 && ip.octets()[2] == 0) // 192.0.0.0/24
+        || a >= 240) // 240.0.0.0/4 reserved
+}
+
+/// Resolves a redirect host and returns its addresses, all of which must be public. The
+/// caller pins the connection to these addresses, so a later answer cannot differ.
+pub async fn resolve_public_addresses(host: &str) -> Result<Vec<SocketAddr>, ResearchError> {
+    let addrs: Vec<SocketAddr> = tokio::net::lookup_host((host, 443))
+        .await
+        .map_err(|e| ResearchError::Unavailable(format!("TDM host lookup failed: {e}")))?
+        .collect();
+    if addrs.is_empty() {
+        return Err(ResearchError::Unavailable(
+            "The TDM host did not resolve to any address.".to_string(),
+        ));
+    }
+    if addrs.iter().any(|a| !is_public_ip(a.ip())) {
+        return Err(ResearchError::InvalidResponse(
+            "A TDM redirect to a host on this computer or a private network was blocked.".to_string(),
+        ));
+    }
+    Ok(addrs)
 }
 
 /// The headers for one hop of a text-mining download. Publisher credentials are sent only
@@ -879,16 +942,24 @@ async fn download_tdm(
     publisher: TdmPublisher,
 ) -> Result<(Vec<u8>, Url), ResearchError> {
     let origin_host = url.host_str().unwrap_or("").to_ascii_lowercase();
-    // Every redirect is followed by hand so each hop's destination and headers are checked.
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(45))
-        .redirect(Policy::none())
-        .build()
-        .map_err(|e| ResearchError::Unavailable(format!("TDM transport error: {e}")))?;
+    // The stored provenance is the publisher's own article address, never a redirect
+    // target, which may carry a signed or tokenised query.
+    let mut provenance = url.clone();
+    strip_url_capability(&mut provenance);
 
+    // Every redirect is followed by hand so each hop's destination, addresses and headers
+    // are checked. The connection is pinned to the addresses that were checked.
     let mut current = url.clone();
     let mut hops = 0usize;
     let mut response = loop {
+        let host = current.host_str().unwrap_or("").to_string();
+        let addrs = resolve_public_addresses(&host).await?;
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(45))
+            .redirect(Policy::none())
+            .resolve_to_addrs(&host, &addrs)
+            .build()
+            .map_err(|e| ResearchError::Unavailable(format!("TDM transport error: {e}")))?;
         let response = client
             .get(current.clone())
             .headers(tdm_hop_headers(&origin_host, &current, &headers))
@@ -939,7 +1010,6 @@ async fn download_tdm(
         return Err(ResearchError::Http(status.as_u16(), hint));
     }
 
-    let final_url = response.url().clone();
     let limit = 20 * 1024 * 1024;
     let mut data = Vec::new();
     while let Some(chunk) = response
@@ -954,7 +1024,7 @@ async fn download_tdm(
         }
         data.extend_from_slice(&chunk);
     }
-    Ok((data, final_url))
+    Ok((data, provenance))
 }
 
 #[derive(Deserialize)]

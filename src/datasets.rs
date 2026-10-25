@@ -55,6 +55,26 @@ impl CancerDatasetUrlPolicy {
     }
 }
 
+/// Values a record may list for one field (cancer types, projects, data types). Catalog
+/// responses are untrusted; this keeps the per-record work and output small.
+const MAX_LISTED_VALUES: usize = 64;
+
+/// The distinct values, in first-seen order, up to `MAX_LISTED_VALUES`. Membership is a set
+/// lookup, so the work is linear in the input.
+fn unique_in_order(values: impl IntoIterator<Item = String>) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for value in values {
+        if out.len() >= MAX_LISTED_VALUES {
+            break;
+        }
+        if seen.insert(value.clone()) {
+            out.push(value);
+        }
+    }
+    out
+}
+
 pub struct CancerDatasetClient {
     gdc_base_url: Url,
     cbio_base_url: Url,
@@ -317,12 +337,8 @@ impl CancerDatasetClient {
                 let encoded = urlencoding::encode(&pid);
                 let portal =
                     Url::parse(&format!("https://portal.gdc.cancer.gov/projects/{encoded}")).ok()?;
-                let mut cancer_types = diseases.clone();
-                for s in &sites {
-                    if !cancer_types.contains(s) {
-                        cancer_types.push(s.clone());
-                    }
-                }
+                let cancer_types =
+                    unique_in_order(diseases.iter().chain(sites.iter()).cloned());
                 let mut summary_parts = vec![name.clone()];
                 if !diseases.is_empty() {
                     summary_parts.push(format!("Disease types: {}", diseases.join(", ")));
@@ -492,21 +508,18 @@ impl CancerDatasetClient {
                     .iter()
                     .filter_map(|c| c.project.as_ref()?.name.clone())
                     .collect();
-                let mut cancer_types = Vec::new();
-                for c in &cases {
-                    if let Some(ref p) = c.project {
-                        for d in p.disease_type.clone().unwrap_or_default() {
-                            if !cancer_types.contains(&d) {
-                                cancer_types.push(d);
-                            }
-                        }
-                        for s in p.primary_site.clone().unwrap_or_default() {
-                            if !cancer_types.contains(&s) {
-                                cancer_types.push(s);
-                            }
-                        }
-                    }
-                }
+                let cancer_types = unique_in_order(cases.iter().flat_map(|c| {
+                    let project = c.project.as_ref();
+                    project
+                        .and_then(|p| p.disease_type.clone())
+                        .unwrap_or_default()
+                        .into_iter()
+                        .chain(
+                            project
+                                .and_then(|p| p.primary_site.clone())
+                                .unwrap_or_default(),
+                        )
+                }));
                 let data_types: Vec<String> = [
                     f.data_category,
                     f.data_type,

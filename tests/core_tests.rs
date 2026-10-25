@@ -397,3 +397,65 @@ async fn continue_with_chatgpt_redirects_to_openai_with_loopback_callback() {
     assert!(!dir.join("chatgpt-auth.json").exists());
     let _ = std::fs::remove_dir_all(dir);
 }
+
+#[test]
+fn data_directory_follows_each_platforms_convention() {
+    use dementia_research_web::store::data_dir_for;
+    use std::ffi::OsString;
+    use std::path::PathBuf;
+
+    let env = |pairs: &'static [(&'static str, &'static str)]| {
+        move |name: &str| {
+            pairs
+                .iter()
+                .find(|(k, _)| *k == name)
+                .map(|(_, v)| OsString::from(*v))
+        }
+    };
+    let windows = data_dir_for(env(&[("APPDATA", "/C/Users/ada/AppData/Roaming"), ("HOME", "/C/Users/ada")]), true, false);
+    assert_eq!(windows, PathBuf::from("/C/Users/ada/AppData/Roaming/DementiaResearch"));
+    // Windows without APPDATA falls back to the profile, never to the working directory.
+    let profile = data_dir_for(env(&[("USERPROFILE", "/C/Users/ada")]), true, false);
+    assert_eq!(profile, PathBuf::from("/C/Users/ada/AppData/Roaming/DementiaResearch"));
+
+    let mac = data_dir_for(env(&[("HOME", "/Users/ada"), ("XDG_DATA_HOME", "/x")]), false, true);
+    assert_eq!(mac, PathBuf::from("/Users/ada/Library/Application Support/DementiaResearch"));
+
+    let xdg = data_dir_for(env(&[("HOME", "/home/ada"), ("XDG_DATA_HOME", "/data/ada")]), false, false);
+    assert_eq!(xdg, PathBuf::from("/data/ada/dementia-research"));
+    let linux = data_dir_for(env(&[("HOME", "/home/ada"), ("XDG_DATA_HOME", "relative")]), false, false);
+    assert_eq!(linux, PathBuf::from("/home/ada/.local/share/dementia-research"));
+
+    let overridden = data_dir_for(env(&[("DEMENTIA_RESEARCH_DATA_DIR", "/srv/dra"), ("APPDATA", "/a")]), true, false);
+    assert_eq!(overridden, PathBuf::from("/srv/dra"));
+}
+
+#[test]
+fn private_file_secret_store_round_trips_with_owner_only_permissions() {
+    use dementia_research_web::providers::KeychainStore;
+
+    let dir = std::env::temp_dir().join(format!("dra-secrets-{}", uuid::Uuid::new_v4()));
+    let path = dir.join("secrets.json");
+    let store = KeychainStore::private_file(&path);
+    assert!(!store.backend().is_encrypted_store());
+
+    store.set("anthropic_api_key", "  sk-ant-test-value  ").expect("save");
+    store.set("openai_api_key", "sk-test-other").expect("save");
+    assert_eq!(store.get("anthropic_api_key").as_deref(), Some("sk-ant-test-value"));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&path).expect("metadata").permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+    }
+
+    // A fresh store reading the same file sees the saved values.
+    let reopened = KeychainStore::private_file(&path);
+    assert_eq!(reopened.get("openai_api_key").as_deref(), Some("sk-test-other"));
+
+    assert!(store.set("anthropic_api_key", "line\nbreak").is_err());
+    store.set("anthropic_api_key", "").expect("blank deletes");
+    assert_eq!(reopened.get("anthropic_api_key"), None);
+    assert_eq!(reopened.get("openai_api_key").as_deref(), Some("sk-test-other"));
+    let _ = std::fs::remove_dir_all(dir);
+}

@@ -46,3 +46,13 @@ base64 = "0.22"
 [dev-dependencies]
 tokio = { version = "1.43", features = ["rt-multi-thread", "macros", "test-util"] }
 http-body-util = "0.1"
+
+# OS secret stores for API keys. macOS uses the Keychain via /usr/bin/security instead
+# (Apple-signed, so rebuilt binaries never trigger Keychain access prompts).
+[target.'cfg(target_os = "windows")'.dependencies]
+keyring-core = "1"
+windows-native-keyring-store = "1"
+
+[target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
+keyring-core = "1"
+zbus-secret-service-keyring-store = { version = "1", features = ["crypto-rust"] }

@@ -2,54 +2,99 @@ use crate::models::{InstitutionalAccess, ResearchError};
 use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, AUTHORIZATION, CONTENT_TYPE};
 use reqwest::redirect::Policy;
 use serde::Deserialize;
+use crate::store::write_private_file;
 use std::collections::HashMap;
-use std::process::Command;
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use url::Url;
 
 const KEYCHAIN_SERVICE: &str = "DementiaResearch";
+const SECRETS_FILE: &str = "secrets.json";
 
-#[derive(Clone, Default)]
+/// Where API keys and institutional tokens are kept. Chosen once at startup.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SecretBackend {
+    /// The macOS login Keychain, through the Apple-signed `/usr/bin/security`.
+    MacKeychain,
+    /// Windows Credential Manager (DPAPI-encrypted, per user).
+    WindowsCredentialManager,
+    /// The freedesktop Secret Service (GNOME Keyring, KWallet, KeePassXC).
+    SecretService,
+    /// An owner-only file, used only when the OS offers no secret store (e.g. headless Linux).
+    PrivateFile(PathBuf),
+    /// Tests only.
+    Memory,
+}
+
+impl SecretBackend {
+    pub fn describe(&self) -> String {
+        match self {
+            SecretBackend::MacKeychain => "the macOS Keychain".to_string(),
+            SecretBackend::WindowsCredentialManager => "Windows Credential Manager".to_string(),
+            SecretBackend::SecretService => "the system keyring (Secret Service)".to_string(),
+            SecretBackend::PrivateFile(path) => {
+                format!("an owner-only file ({})", path.display())
+            }
+            SecretBackend::Memory => "memory".to_string(),
+        }
+    }
+
+    /// False when secrets fall back to a plain (owner-only) file.
+    pub fn is_encrypted_store(&self) -> bool {
+        !matches!(self, SecretBackend::PrivateFile(_))
+    }
+}
+
+#[derive(Clone)]
 pub struct KeychainStore {
-    in_memory: Option<Arc<Mutex<HashMap<String, String>>>>,
+    backend: SecretBackend,
+    // Holds the secrets for `Memory`; for `PrivateFile` it only serializes rewrites.
+    memory: Arc<Mutex<HashMap<String, String>>>,
 }
 
 impl KeychainStore {
-    pub fn system() -> Self {
-        Self { in_memory: None }
+    /// The OS secret store, or an owner-only `secrets.json` in `data_dir` when there is none.
+    pub fn system(data_dir: &Path) -> Self {
+        let backend = os_secret_backend()
+            .unwrap_or_else(|| SecretBackend::PrivateFile(data_dir.join(SECRETS_FILE)));
+        Self {
+            backend,
+            memory: Arc::default(),
+        }
+    }
+
+    /// Secrets in an owner-only JSON file, as used when the OS has no secret store.
+    pub fn private_file(path: impl Into<PathBuf>) -> Self {
+        Self {
+            backend: SecretBackend::PrivateFile(path.into()),
+            memory: Arc::default(),
+        }
     }
 
     pub fn in_memory() -> Self {
         Self {
-            in_memory: Some(Arc::new(Mutex::new(HashMap::new()))),
+            backend: SecretBackend::Memory,
+            memory: Arc::default(),
         }
     }
 
+    pub fn backend(&self) -> &SecretBackend {
+        &self.backend
+    }
+
     pub fn get(&self, account: &str) -> Option<String> {
-        if let Some(ref mem) = self.in_memory {
-            return mem.lock().ok()?.get(account).cloned();
-        }
-        if cfg!(target_os = "macos") {
-            let output = Command::new("/usr/bin/security")
-                .args([
-                    "find-generic-password",
-                    "-s",
-                    KEYCHAIN_SERVICE,
-                    "-a",
-                    account,
-                    "-w",
-                ])
-                .output()
-                .ok()?;
-            if output.status.success() {
-                let s = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                if !s.is_empty() {
-                    return Some(s);
-                }
+        let value = match &self.backend {
+            SecretBackend::Memory => self.memory.lock().ok()?.get(account).cloned(),
+            SecretBackend::MacKeychain => mac_keychain_get(account),
+            SecretBackend::WindowsCredentialManager | SecretBackend::SecretService => {
+                os_store_get(account)
             }
-        }
-        None
+            SecretBackend::PrivateFile(path) => read_secrets_file(path).remove(account),
+        };
+        value.filter(|v| !v.is_empty())
     }
 
     pub fn set(&self, account: &str, value: &str) -> Result<(), ResearchError> {
@@ -57,54 +102,60 @@ impl KeychainStore {
         if trimmed.is_empty() {
             return self.delete(account);
         }
-        if let Some(ref mem) = self.in_memory {
-            if let Ok(mut guard) = mem.lock() {
-                guard.insert(account.to_string(), trimmed.to_string());
-            }
-            return Ok(());
+        if trimmed.chars().any(char::is_control) {
+            return Err(ResearchError::InvalidResponse(
+                "Credentials cannot contain line breaks or control characters.".to_string(),
+            ));
         }
-        if cfg!(target_os = "macos") {
-            let status = Command::new("/usr/bin/security")
-                .args([
-                    "add-generic-password",
-                    "-U",
-                    "-s",
-                    KEYCHAIN_SERVICE,
-                    "-a",
-                    account,
-                    "-w",
-                    trimmed,
-                ])
-                .status()
-                .map_err(|e| ResearchError::Unavailable(format!("Keychain error: {e}")))?;
-            if !status.success() {
-                return Err(ResearchError::Unavailable(
-                    "macOS Keychain rejected saving the credential.".to_string(),
-                ));
+        match &self.backend {
+            SecretBackend::Memory => {
+                if let Ok(mut guard) = self.memory.lock() {
+                    guard.insert(account.to_string(), trimmed.to_string());
+                }
+                Ok(())
+            }
+            SecretBackend::MacKeychain => mac_keychain_set(account, trimmed),
+            SecretBackend::WindowsCredentialManager | SecretBackend::SecretService => {
+                os_store_set(account, trimmed)
+            }
+            SecretBackend::PrivateFile(path) => {
+                let _guard = self.memory.lock();
+                let mut secrets = read_secrets_file(path);
+                secrets.insert(account.to_string(), trimmed.to_string());
+                write_secrets_file(path, &secrets)
             }
         }
-        Ok(())
     }
 
     pub fn delete(&self, account: &str) -> Result<(), ResearchError> {
-        if let Some(ref mem) = self.in_memory {
-            if let Ok(mut guard) = mem.lock() {
-                guard.remove(account);
+        match &self.backend {
+            SecretBackend::Memory => {
+                if let Ok(mut guard) = self.memory.lock() {
+                    guard.remove(account);
+                }
+                Ok(())
             }
-            return Ok(());
+            SecretBackend::MacKeychain => {
+                // Fails harmlessly when the item does not exist.
+                let _ = Command::new("/usr/bin/security")
+                    .args(["delete-generic-password", "-s", KEYCHAIN_SERVICE, "-a", account])
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status();
+                Ok(())
+            }
+            SecretBackend::WindowsCredentialManager | SecretBackend::SecretService => {
+                os_store_delete(account)
+            }
+            SecretBackend::PrivateFile(path) => {
+                let _guard = self.memory.lock();
+                let mut secrets = read_secrets_file(path);
+                if secrets.remove(account).is_some() {
+                    write_secrets_file(path, &secrets)?;
+                }
+                Ok(())
+            }
         }
-        if cfg!(target_os = "macos") {
-            let _ = Command::new("/usr/bin/security")
-                .args([
-                    "delete-generic-password",
-                    "-s",
-                    KEYCHAIN_SERVICE,
-                    "-a",
-                    account,
-                ])
-                .status();
-        }
-        Ok(())
     }
 
     pub fn institutional_access(&self) -> InstitutionalAccess {
@@ -135,6 +186,146 @@ impl KeychainStore {
         )?;
         Ok(())
     }
+}
+
+fn mac_keychain_get(account: &str) -> Option<String> {
+    let output = Command::new("/usr/bin/security")
+        .args(["find-generic-password", "-s", KEYCHAIN_SERVICE, "-a", account, "-w"])
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+/// Writes through `security -i` so the secret travels on stdin, never on a command line
+/// where other local processes could read it. `security -i` reports no errors, so the
+/// write is verified by reading it back.
+fn mac_keychain_set(account: &str, value: &str) -> Result<(), ResearchError> {
+    let quote = |s: &str| format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""));
+    let command = format!(
+        "add-generic-password -U -s {} -a {} -w {}\n",
+        quote(KEYCHAIN_SERVICE),
+        quote(account),
+        quote(value)
+    );
+    let failed = |e: std::io::Error| ResearchError::Unavailable(format!("Keychain error: {e}"));
+    let mut child = Command::new("/usr/bin/security")
+        .arg("-i")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(failed)?;
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin.write_all(command.as_bytes()).map_err(failed)?;
+    }
+    child.wait().map_err(failed)?;
+    if mac_keychain_get(account).as_deref() != Some(value) {
+        return Err(ResearchError::Unavailable(
+            "The macOS Keychain did not save the credential. Check that the login keychain is unlocked.".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn os_secret_backend() -> Option<SecretBackend> {
+    Some(SecretBackend::MacKeychain)
+}
+
+#[cfg(target_os = "windows")]
+fn os_secret_backend() -> Option<SecretBackend> {
+    let store = windows_native_keyring_store::Store::new().ok()?;
+    keyring_core::set_default_store(store);
+    Some(SecretBackend::WindowsCredentialManager)
+}
+
+/// Connects to the Secret Service over D-Bus; fails where none runs (servers, containers).
+#[cfg(all(unix, not(target_os = "macos")))]
+fn os_secret_backend() -> Option<SecretBackend> {
+    let store = zbus_secret_service_keyring_store::Store::new().ok()?;
+    keyring_core::set_default_store(store);
+    Some(SecretBackend::SecretService)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn os_secret_backend() -> Option<SecretBackend> {
+    None
+}
+
+#[cfg(any(windows, all(unix, not(target_os = "macos"))))]
+fn os_store_entry(account: &str) -> Result<keyring_core::Entry, ResearchError> {
+    keyring_core::Entry::new(KEYCHAIN_SERVICE, account)
+        .map_err(|e| ResearchError::Unavailable(format!("Credential store error: {e}")))
+}
+
+#[cfg(any(windows, all(unix, not(target_os = "macos"))))]
+fn os_store_get(account: &str) -> Option<String> {
+    os_store_entry(account).ok()?.get_password().ok()
+}
+
+#[cfg(any(windows, all(unix, not(target_os = "macos"))))]
+fn os_store_set(account: &str, value: &str) -> Result<(), ResearchError> {
+    os_store_entry(account)?
+        .set_password(value)
+        .map_err(|e| ResearchError::Unavailable(format!("Credential store did not save: {e}")))
+}
+
+#[cfg(any(windows, all(unix, not(target_os = "macos"))))]
+fn os_store_delete(account: &str) -> Result<(), ResearchError> {
+    match os_store_entry(account)?.delete_credential() {
+        Ok(()) | Err(keyring_core::Error::NoEntry) => Ok(()),
+        Err(e) => Err(ResearchError::Unavailable(format!(
+            "Credential store did not delete: {e}"
+        ))),
+    }
+}
+
+// Only reachable through the Windows/Secret Service backends, which macOS never selects.
+#[cfg(target_os = "macos")]
+fn os_store_get(_account: &str) -> Option<String> {
+    None
+}
+
+#[cfg(target_os = "macos")]
+fn os_store_set(_account: &str, _value: &str) -> Result<(), ResearchError> {
+    Err(ResearchError::Unavailable("No OS credential store.".to_string()))
+}
+
+#[cfg(target_os = "macos")]
+fn os_store_delete(_account: &str) -> Result<(), ResearchError> {
+    Ok(())
+}
+
+#[cfg(not(any(unix, windows)))]
+fn os_store_get(_account: &str) -> Option<String> {
+    None
+}
+
+#[cfg(not(any(unix, windows)))]
+fn os_store_set(_account: &str, _value: &str) -> Result<(), ResearchError> {
+    Err(ResearchError::Unavailable("No OS credential store.".to_string()))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn os_store_delete(_account: &str) -> Result<(), ResearchError> {
+    Ok(())
+}
+
+fn read_secrets_file(path: &Path) -> HashMap<String, String> {
+    std::fs::read(path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default()
+}
+
+fn write_secrets_file(path: &Path, secrets: &HashMap<String, String>) -> Result<(), ResearchError> {
+    let payload = serde_json::to_vec_pretty(secrets)
+        .map_err(|e| ResearchError::InvalidResponse(format!("Could not encode credentials: {e}")))?;
+    write_private_file(path, &payload)
 }
 
 pub fn redact_secret(text: &str, secret: &str) -> String {

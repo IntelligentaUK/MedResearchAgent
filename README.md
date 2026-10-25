@@ -15,9 +15,9 @@ To minimize attack surface while handling untrusted scientific literature (JATS 
    - All 8 workspace views are server-rendered HTML with strict contextual escaping ([`html_escape`](src/web.rs)) and a locked-down Content Security Policy (`default-src 'self'; frame-ancestors 'none'`).
 4. **Constant-Time CSRF & Same-Origin Enforcement**:
    - Every state-changing `POST` endpoint validates a 256-bit session CSRF token in constant time using `subtle::ConstantTimeEq` ([`verify_csrf`](src/web.rs)) and enforces `Sec-Fetch-Site` (`same-origin` / `none`) + loopback `Origin` verification ([`same_origin_allowed`](src/web.rs)).
-5. **Loopback-Only Binding & Keychain Isolation**:
+5. **Loopback-Only Binding & OS Secret Storage**:
    - [`src/main.rs`](src/main.rs) binds exclusively to `127.0.0.1:8080` by default and refuses non-loopback interfaces.
-   - API keys and institutional TDM tokens are stored in the macOS Keychain via `/usr/bin/security` ([`KeychainStore`](src/providers.rs)), redacted from all transport errors, and never written to `library.json` or echoed in HTML.
+   - API keys and institutional TDM tokens are stored in the operating system's secret store ([`KeychainStore`](src/providers.rs)): the macOS Keychain (through the Apple-signed `/usr/bin/security`, with secrets passed on stdin rather than the command line), Windows Credential Manager, or the Linux Secret Service. They are redacted from all transport errors and never written to `library.json` or echoed in HTML.
    - `library.json` is written atomically via a temporary file with `0600` (owner-only) permissions ([`LibraryStore::save`](src/store.rs)).
 6. **Domain & Evidence Integrity**:
    - **Abstract Exclusion**: Every Europe PMC query includes `NOT PUB_TYPE:"Abstract"`, and `Paper::is_conference_abstract` drops any conference abstract before full-text retrieval attempts in discovery, validation, and connection agents.
@@ -75,8 +75,25 @@ The first build downloads and compiles all dependencies and takes a few minutes.
 ### Configuration
 
 - **Address**: set `DEMENTIA_RESEARCH_ADDR` to change the listening address, e.g. `DEMENTIA_RESEARCH_ADDR=127.0.0.1:3000 cargo run --release`. Only loopback addresses (`127.0.0.1`, `::1`) are accepted; anything else exits with an error.
-- **Model access**: either **Continue with ChatGPT** (see below) or enter Claude/OpenAI API keys in **Sources & credentials**. API keys and institutional TDM tokens are stored in the macOS Keychain, not in environment variables or files; on Windows and Linux they are not yet persisted, so use Sign in with ChatGPT there.
-- **Library location**: research state is saved to `~/Library/Application Support/DementiaResearch/library.json` on macOS (`~/.local/share/dementia-research/library.json` elsewhere).
+- **Model access**: either **Continue with ChatGPT** (see below) or enter Claude/OpenAI API keys in **Sources & credentials**.
+- **Data directory**: `library.json` and the ChatGPT credential files live in the per-user data directory, printed at startup. Set `DEMENTIA_RESEARCH_DATA_DIR` (an absolute path) to use another one.
+
+  | OS | Data directory |
+  |---|---|
+  | macOS | `~/Library/Application Support/DementiaResearch` (shared with the Swift app) |
+  | Windows | `%APPDATA%\DementiaResearch` |
+  | Linux and other Unix | `$XDG_DATA_HOME/dementia-research`, else `~/.local/share/dementia-research` |
+
+- **Where API keys are stored**: the startup output and **Sources & credentials** both say which store is in use.
+
+  | OS | Secret store |
+  |---|---|
+  | macOS | Login Keychain (service `DementiaResearch`) |
+  | Windows | Windows Credential Manager (DPAPI-encrypted, per user) |
+  | Linux desktop | Secret Service: GNOME Keyring, KWallet or KeePassXC |
+  | No secret store (servers, containers, WSL) | Owner-only `secrets.json` in the data directory, with a warning |
+
+  The store is chosen when the app starts, so after installing or unlocking a keyring, restart the app to use it. Keys are never moved between stores automatically.
 
 ### Sign in with ChatGPT
 

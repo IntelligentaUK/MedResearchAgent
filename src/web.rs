@@ -10,6 +10,7 @@ use crate::models::{
 };
 use crate::providers::{
     ChatGptPlanProvider, ClaudeProvider, KeychainStore, ModelVendor, OpenAiProvider,
+    SecretBackend,
 };
 use crate::report::ResearchReportBuilder;
 use crate::store::LibraryStore;
@@ -238,6 +239,7 @@ async fn index_handler(
         has_claude_key,
         has_openai_key,
         &chatgpt,
+        state.keychain.backend(),
     ))
 }
 
@@ -992,11 +994,13 @@ async fn save_credentials_handler(
     if state.keychain.save_institutional_access(&updated).is_err() {
         failures.push("institutional access settings");
     }
+    let store = state.keychain.backend().describe();
     let flash = if failures.is_empty() {
-        "Credentials updated in macOS Keychain.".to_string()
+        format!("Credentials saved to {store}.")
     } else {
         format!(
-            "macOS Keychain did not save: {}. Check that the login keychain is unlocked.",
+            "{} did not save: {}. Check that it is unlocked and available.",
+            capitalize(&store),
             failures.join(", ")
         )
     };
@@ -1115,6 +1119,7 @@ fn render_workspace(
     has_claude_key: bool,
     has_openai_key: bool,
     chatgpt: &ChatGptStatus,
+    secret_store: &SecretBackend,
 ) -> String {
     let domain = lib.pipeline.settings.domain();
     let domain_papers = lib.research_papers(domain);
@@ -1186,6 +1191,7 @@ fn render_workspace(
             has_claude_key,
             has_openai_key,
             chatgpt,
+            secret_store,
         ),
         "connections" => render_connections_section(&domain_connections, csrf_token),
         _ => render_loop_section(lib, domain, csrf_token, chatgpt),
@@ -1683,8 +1689,15 @@ fn render_sources_section(
     has_claude_key: bool,
     has_openai_key: bool,
     chatgpt: &ChatGptStatus,
+    secret_store: &SecretBackend,
 ) -> String {
     let csrf = html_escape(csrf_token);
+    let store_name = html_escape(&secret_store.describe());
+    let store_note = if secret_store.is_encrypted_store() {
+        String::new()
+    } else {
+        r#"<p class="caption">No system keyring was found on this computer, so these are kept in an owner-only file instead. Install and unlock a keyring (such as GNOME Keyring or KWallet) and restart the app to use it.</p>"#.to_string()
+    };
     let chatgpt_card = render_chatgpt_card(&csrf, chatgpt);
     let journals = ResearchSourceCatalog::all_journals(domain);
     let max_records = ResearchSourceCatalog::maximum_records(domain);
@@ -1719,34 +1732,36 @@ fn render_sources_section(
     }
 
     let claude_status = if has_claude_key {
-        "Configured in Keychain"
+        "Saved"
     } else {
         "Not configured"
     };
     let openai_status = if has_openai_key {
-        "Configured in Keychain"
+        "Saved"
     } else {
         "Not configured"
     };
     let elsevier_status = if access.elsevier_api_key.is_some() {
-        "Configured in Keychain"
+        "Saved"
     } else {
         "Not configured"
     };
     let wiley_status = if access.wiley_tdm_token.is_some() {
-        "Configured in Keychain"
+        "Saved"
     } else {
         "Not configured"
     };
 
     format!(
         r#"<header class="page-header">
-        <h2>Configured Sources &amp; Keychain Credentials ({})</h2>
+        <h2>Configured Sources &amp; Credentials ({})</h2>
         <p>Per-search cap: <strong>{max_records}</strong> records ({} field journals × 3 + {} mechanism journals × 2 + wider Europe PMC corpus × {WIDER_CORPUS_PAGE_SIZE}).</p>
       </header>
       {chatgpt_card}
       <section class="card">
-        <h3>macOS Keychain Credentials (Never stored in <code>library.json</code> or echoed to HTML)</h3>
+        <h3>API Keys &amp; Institutional Credentials</h3>
+        <p class="caption">Stored in {store_name}. Never written to <code>library.json</code> or shown on this page.</p>
+        {store_note}
         <form method="post" action="/credentials" class="stack">
           <input type="hidden" name="csrf_token" value="{csrf}">
           <div class="grid-two">
@@ -1769,7 +1784,7 @@ fn render_sources_section(
               <input type="url" name="library_proxy_prefix" placeholder="https://ezproxy.example.edu/login?url=">
             </label>
           </div>
-          <button type="submit" class="btn-primary">Save to Keychain</button>
+          <button type="submit" class="btn-primary">Save Credentials</button>
         </form>
       </section>
       <div class="stack">{journal_rows}</div>"#,
@@ -1777,6 +1792,14 @@ fn render_sources_section(
         ResearchSourceCatalog::journals(domain).len(),
         ResearchSourceCatalog::mechanism_journals(domain).len()
     )
+}
+
+fn capitalize(text: &str) -> String {
+    let mut chars = text.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().chain(chars).collect(),
+        None => String::new(),
+    }
 }
 
 fn render_chatgpt_card(csrf: &str, chatgpt: &ChatGptStatus) -> String {

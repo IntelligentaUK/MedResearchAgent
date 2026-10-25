@@ -44,6 +44,59 @@ pub(crate) fn write_private_file(path: &Path, payload: &[u8]) -> Result<(), Rese
     Ok(())
 }
 
+/// The per-user directory for `library.json` and the ChatGPT credential files.
+/// `DEMENTIA_RESEARCH_DATA_DIR` overrides it; otherwise:
+/// - macOS: `~/Library/Application Support/DementiaResearch` (shared with the Swift app)
+/// - Windows: `%APPDATA%\DementiaResearch`
+/// - Linux and other Unix: `$XDG_DATA_HOME/dementia-research`, else `~/.local/share/dementia-research`
+pub fn data_dir() -> PathBuf {
+    data_dir_for(
+        |name| std::env::var_os(name),
+        cfg!(windows),
+        cfg!(target_os = "macos"),
+    )
+}
+
+/// [`data_dir`] with the environment and OS supplied, so every platform's rule is testable.
+pub fn data_dir_for(
+    env: impl Fn(&str) -> Option<std::ffi::OsString>,
+    windows: bool,
+    macos: bool,
+) -> PathBuf {
+    let env_dir = |name: &str| env(name).map(PathBuf::from).filter(|p| p.is_absolute());
+    if let Some(dir) = env_dir("DEMENTIA_RESEARCH_DATA_DIR") {
+        return dir;
+    }
+    if windows {
+        if let Some(app_data) = env_dir("APPDATA") {
+            return app_data.join("DementiaResearch");
+        }
+        if let Some(profile) = env_dir("USERPROFILE") {
+            return profile
+                .join("AppData")
+                .join("Roaming")
+                .join("DementiaResearch");
+        }
+    }
+    let home = env_dir("HOME");
+    if macos {
+        if let Some(home) = home {
+            return home
+                .join("Library")
+                .join("Application Support")
+                .join("DementiaResearch");
+        }
+    }
+    if let Some(xdg) = env_dir("XDG_DATA_HOME") {
+        return xdg.join("dementia-research");
+    }
+    match home {
+        Some(home) => home.join(".local").join("share").join("dementia-research"),
+        // Last resort when no home directory is known.
+        None => PathBuf::from("dementia-research-data"),
+    }
+}
+
 pub struct LibraryStore {
     file_path: PathBuf,
 }
@@ -56,18 +109,8 @@ impl LibraryStore {
     }
 
     pub fn default_store() -> Self {
-        let base = std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("."));
-        let dir = if cfg!(target_os = "macos") {
-            base.join("Library")
-                .join("Application Support")
-                .join("DementiaResearch")
-        } else {
-            base.join(".local").join("share").join("dementia-research")
-        };
         Self {
-            file_path: dir.join("library.json"),
+            file_path: data_dir().join("library.json"),
         }
     }
 

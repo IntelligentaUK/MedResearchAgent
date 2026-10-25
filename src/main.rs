@@ -1,15 +1,21 @@
 #![forbid(unsafe_code)]
 
 use dementia_research_web::providers::KeychainStore;
-use dementia_research_web::store::LibraryStore;
+use dementia_research_web::store::{data_dir, LibraryStore};
 use dementia_research_web::web::{build_router, AppState};
 use std::net::SocketAddr;
 use tokio::net::TcpListener;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let store = LibraryStore::default_store();
-    let keychain = KeychainStore::system();
+    let data_dir = data_dir();
+    let store = LibraryStore::new(data_dir.join("library.json"));
+    let keychain = KeychainStore::system(&data_dir);
+    println!("Data directory: {}", data_dir.display());
+    println!("Credentials are stored in {}.", keychain.backend().describe());
+    if !keychain.backend().is_encrypted_store() {
+        eprintln!("No system secret store was found, so API keys are kept in an owner-only file instead.");
+    }
     let state = AppState::new(store, keychain)?;
     let app = build_router(state);
 

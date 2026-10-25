@@ -26,7 +26,15 @@ pub struct EvidenceDocument {
     /// Recorded on verified citations and never encoded into model prompts.
     #[serde(skip)]
     pub checksum: Option<String>,
+    /// Whether the paper's body may not be redistributed, so generated text may quote it
+    /// only inside verified citations. Never encoded into model prompts.
+    #[serde(skip)]
+    pub restricted: bool,
 }
+
+/// A run of this many consecutive words shared with a restricted passage marks a generated
+/// field as copying the source rather than describing it.
+pub const RESTRICTED_OVERLAP_WORDS: usize = 12;
 
 /// The one exact-quote rule for every citation path. A quote matches when, after
 /// collapsing whitespace and folding typographic quote marks and dashes, it is a
@@ -262,6 +270,7 @@ impl EvidenceValidator {
                     is_preprint: paper.is_preprint,
                     passages: excerpts,
                     checksum: paper.full_text.as_ref().map(|ft| ft.checksum.clone()),
+                    restricted: paper.is_body_redistribution_restricted(),
                 })
             })
             .collect()
@@ -325,6 +334,21 @@ impl EvidenceValidator {
             return Err(ResearchError::InvalidResponse(
                 "A generated hypothesis needs all scientific fields, necessary claims, two distinct predictions, a falsifier and credible alternatives.".to_string(),
             ));
+        }
+
+        let narrative: Vec<&str> = required
+            .iter()
+            .map(|s| s.as_str())
+            .chain(draft.necessary_claims.iter().map(String::as_str))
+            .chain(draft.predictions.iter().map(String::as_str))
+            .chain(draft.falsification_criteria.iter().map(String::as_str))
+            .chain(draft.alternatives.iter().map(String::as_str))
+            .chain(draft.citations.iter().map(|c| c.interpretation.as_str()))
+            .collect();
+        if let Some(why) = Self::restricted_overlap(&narrative, documents) {
+            return Err(ResearchError::InvalidResponse(format!(
+                "A hypothesis field {why}. Describe the evidence in your own words and keep exact wording to the citation quotes."
+            )));
         }
 
         let cited_papers: HashSet<&str> =
@@ -447,8 +471,47 @@ impl EvidenceValidator {
                     paper.evidence_passages()
                 },
                 checksum: paper.full_text.as_ref().map(|ft| ft.checksum.clone()),
+                restricted: paper.is_body_redistribution_restricted(),
             })
             .collect()
+    }
+
+    /// Finds a generated field that reproduces a restricted passage: any run of
+    /// `RESTRICTED_OVERLAP_WORDS` consecutive words (case and punctuation ignored) that also
+    /// occurs in a passage of a restricted document. Returns what to tell the model.
+    pub fn restricted_overlap(fields: &[&str], documents: &[EvidenceDocument]) -> Option<String> {
+        let words = |text: &str| -> Vec<String> {
+            text.to_lowercase()
+                .split(|c: char| !c.is_alphanumeric())
+                .filter(|w| !w.is_empty())
+                .map(str::to_string)
+                .collect()
+        };
+        let mut shingles: HashSet<String> = HashSet::new();
+        for document in documents.iter().filter(|d| d.restricted) {
+            for passage in &document.passages {
+                let w = words(&passage.text);
+                for window in w.windows(RESTRICTED_OVERLAP_WORDS) {
+                    shingles.insert(window.join(" "));
+                }
+            }
+        }
+        if shingles.is_empty() {
+            return None;
+        }
+        for field in fields {
+            let w = words(field);
+            for window in w.windows(RESTRICTED_OVERLAP_WORDS) {
+                let key = window.join(" ");
+                if shingles.contains(&key) {
+                    return Some(format!(
+                        "copies article text verbatim (\"{} …\") from a source that may only be quoted inside a citation",
+                        window[..6].join(" ")
+                    ));
+                }
+            }
+        }
+        None
     }
 
     pub fn verification_summary(citations: &[EvidenceCitation]) -> String {

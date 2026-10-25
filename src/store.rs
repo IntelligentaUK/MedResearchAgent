@@ -299,6 +299,7 @@ impl LibraryStore {
         snapshot
             .pipeline
             .record(format!("Assessed hypothesis {hyp_id}: {verdict_label}."));
+        Self::reverify_all_citations(snapshot);
     }
 
     pub fn complete_discovery(
@@ -340,6 +341,7 @@ impl LibraryStore {
             "Completed {} discovery cycle ({added} new hypotheses queued).",
             domain.display_name()
         ));
+        Self::reverify_all_citations(snapshot);
     }
 
     pub fn complete_connection(
@@ -390,6 +392,7 @@ impl LibraryStore {
             "Completed {} connection review ({added} proposals queued).",
             domain.display_name()
         ));
+        Self::reverify_all_citations(snapshot);
     }
 
     pub fn merge_datasets(snapshot: &mut LibrarySnapshot, records: Vec<ResearchDatasetRecord>) {

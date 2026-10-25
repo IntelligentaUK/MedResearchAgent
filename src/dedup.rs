@@ -1,4 +1,4 @@
-use crate::models::{normalize_doi, Paper};
+use crate::models::{identifiers_conflict, normalize_doi, Paper};
 use std::collections::HashSet;
 use std::hash::Hash;
 
@@ -39,8 +39,11 @@ impl PaperDeduplicator {
         groups.into_iter().map(|(p, _)| p).collect()
     }
 
+    /// Two records may be merged only when they describe the same version and no identifier
+    /// they both state disagrees. A record carrying one paper's DOI and another's PMID is
+    /// not a bridge between them; it is left on its own.
     fn compatible(a: &Paper, b: &Paper) -> bool {
-        a.is_preprint == b.is_preprint && a.version == b.version
+        a.is_preprint == b.is_preprint && a.version == b.version && !identifiers_conflict(a, b)
     }
 
     fn identifiers(paper: &Paper) -> HashSet<String> {

@@ -329,11 +329,19 @@ pub fn normalize_doi(raw: Option<&str>) -> Option<String> {
     }
 }
 
-/// Licence wordings and URLs that permit the article body to be redistributed. The list is an
-/// allowlist: a licence that matches none of them, or no licence at all, keeps the body local.
-const REDISTRIBUTABLE_LICENSE_MARKERS: &[&str] = &[
-    "creativecommons.org/licenses/",
-    "creativecommons.org/publicdomain/",
+/// What a licence statement establishes about redistributing the article body.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LicenseClass {
+    /// Names a known open licence outright, or links to one on creativecommons.org.
+    Open,
+    /// Says copying or redistribution is not allowed.
+    Restricted,
+    /// Says nothing recognisable either way.
+    Unknown,
+}
+
+/// Open-licence names, matched as whole words and only when not negated just before.
+const OPEN_LICENSE_MARKERS: &[&str] = &[
     "creative commons attribution",
     "creative commons zero",
     "cc by",
@@ -342,34 +350,166 @@ const REDISTRIBUTABLE_LICENSE_MARKERS: &[&str] = &[
     "public domain",
 ];
 
-/// Wordings that forbid redistribution; any one of them outweighs a permissive marker.
+/// Wordings that forbid redistribution; any one of them outweighs every open marker.
 const RESTRICTED_LICENSE_MARKERS: &[&str] = &[
     "no open redistribution",
     "not for redistribution",
     "no redistribution",
-    "all rights reserved",
+    "rights reserved",
+    "prohibited",
+    "not licensed",
+    "not licenced",
+    "permission required",
+    "requires permission",
+    "subscription",
 ];
 
+/// Words that, within the three words before an open-licence name, negate it
+/// ("not licensed under CC BY", "no Creative Commons Attribution licence applies").
+const LICENSE_NEGATIONS: &[&str] = &[
+    "not", "no", "non", "without", "except", "neither", "nor", "unless", "isn't", "aren't",
+];
+
+/// A licence URL counts only when it is a Creative Commons licence or public-domain
+/// declaration on creativecommons.org itself; any other address establishes nothing.
+pub fn classify_license_url(url: &Url) -> LicenseClass {
+    let host_ok = matches!(
+        url.host_str().map(|h| h.to_ascii_lowercase()).as_deref(),
+        Some("creativecommons.org") | Some("www.creativecommons.org")
+    );
+    let path = url.path().to_ascii_lowercase();
+    if matches!(url.scheme(), "http" | "https")
+        && host_ok
+        && (path.starts_with("/licenses/") || path.starts_with("/publicdomain/"))
+    {
+        LicenseClass::Open
+    } else {
+        LicenseClass::Unknown
+    }
+}
+
+/// Classifies free-form licence prose. Restrictive wording anywhere wins; an open licence
+/// name counts only as a whole word that is not negated; a URL in the prose counts only
+/// when `classify_license_url` accepts it.
+pub fn classify_license_text(text: &str) -> LicenseClass {
+    let lower = text
+        .to_lowercase()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if RESTRICTED_LICENSE_MARKERS.iter().any(|m| lower.contains(m)) {
+        return LicenseClass::Restricted;
+    }
+    let bytes = lower.as_bytes();
+    let boundary = |at: usize| at >= bytes.len() || !bytes[at].is_ascii_alphanumeric();
+    let mut open = false;
+    for marker in OPEN_LICENSE_MARKERS {
+        for (at, _) in lower.match_indices(marker) {
+            let end = at + marker.len();
+            let before_ok = at == 0 || boundary(at - 1);
+            if before_ok && boundary(end) && !license_negated(&lower[..at]) {
+                open = true;
+            }
+        }
+    }
+    for token in lower.split_whitespace().filter(|t| t.starts_with("http")) {
+        let trimmed = token.trim_end_matches(['.', ',', ';', ')', ']']);
+        if Url::parse(trimmed).is_ok_and(|u| classify_license_url(&u) == LicenseClass::Open) {
+            open = true;
+        }
+    }
+    if open {
+        LicenseClass::Open
+    } else {
+        LicenseClass::Unknown
+    }
+}
+
+fn license_negated(before: &str) -> bool {
+    before
+        .split(|c: char| !c.is_alphanumeric() && c != '\'')
+        .filter(|w| !w.is_empty())
+        .rev()
+        .take(3)
+        .any(|w| LICENSE_NEGATIONS.contains(&w))
+}
+
 /// Whether the licence statements (from the record and the document) and licence URL,
-/// taken together, establish that the article body may be redistributed. Unknown, missing
-/// or conflicting terms do not.
+/// taken together, establish that the article body may be redistributed. Any restrictive
+/// statement wins; unknown, missing or merely suggestive terms do not permit.
 pub fn license_permits_redistribution<'a>(
     statements: impl IntoIterator<Item = &'a str>,
     license_url: Option<&Url>,
 ) -> bool {
-    let mut text: String = statements
-        .into_iter()
-        .map(str::to_lowercase)
-        .collect::<Vec<_>>()
-        .join(" ");
-    if let Some(url) = license_url {
-        text.push(' ');
-        text.push_str(&url.as_str().to_lowercase());
+    let mut permitted = false;
+    for statement in statements {
+        match classify_license_text(statement) {
+            LicenseClass::Restricted => return false,
+            LicenseClass::Open => permitted = true,
+            LicenseClass::Unknown => {}
+        }
     }
-    if RESTRICTED_LICENSE_MARKERS.iter().any(|m| text.contains(m)) {
-        return false;
+    if license_url.is_some_and(|u| classify_license_url(u) == LicenseClass::Open) {
+        permitted = true;
     }
-    REDISTRIBUTABLE_LICENSE_MARKERS.iter().any(|m| text.contains(m))
+    permitted
+}
+
+/// Whether two records state different values for the same identifier (DOI, PMID or
+/// PMCID). Records that merely lack an identifier do not conflict.
+pub fn identifiers_conflict(a: &Paper, b: &Paper) -> bool {
+    fn differs(x: Option<String>, y: Option<String>) -> bool {
+        matches!((x, y), (Some(x), Some(y)) if x != y)
+    }
+    let pmid = |p: &Option<String>| {
+        p.as_deref()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    };
+    let pmcid = |p: &Option<String>| {
+        p.as_deref()
+            .map(|s| s.trim().to_uppercase().replace("PMC", ""))
+            .filter(|s| !s.is_empty())
+    };
+    differs(normalize_doi(a.doi.as_deref()), normalize_doi(b.doi.as_deref()))
+        || differs(pmid(&a.pmid), pmid(&b.pmid))
+        || differs(pmcid(&a.pmcid), pmcid(&b.pmcid))
+}
+
+/// Characters of verified quotation one hypothesis or claim may reproduce, in an export,
+/// from a paper whose body is not redistributable.
+pub const RESTRICTED_QUOTE_ALLOWANCE: usize = 1_000;
+
+/// Replaces a quotation that exceeds the allowance in exported JSON.
+pub const QUOTE_NOT_REPRODUCED: &str =
+    "[quotation not reproduced: the allowance for this source without an open redistribution licence was reached]";
+
+/// Keeps at most `RESTRICTED_QUOTE_ALLOWANCE` quoted characters per restricted source in
+/// one citation list; later quotations keep their passage reference but not their text.
+pub fn cap_restricted_quotations(citations: &mut [EvidenceCitation], restricted: &HashSet<String>) {
+    let mut used: HashMap<String, usize> = HashMap::new();
+    for cit in citations.iter_mut() {
+        if !restricted.contains(&cit.paper_id) {
+            continue;
+        }
+        let length = cit.quote.chars().count();
+        let total = used.entry(cit.paper_id.clone()).or_insert(0);
+        if *total + length > RESTRICTED_QUOTE_ALLOWANCE {
+            cit.quote = QUOTE_NOT_REPRODUCED.to_string();
+            cit.matched_text = None;
+        } else {
+            *total += length;
+        }
+    }
+}
+
+/// Removes the parts of a URL that can carry a capability: userinfo, query and fragment.
+/// A signed or tokenised download address becomes a plain provenance address.
+pub fn strip_url_capability(url: &mut Url) {
+    url.set_query(None);
+    url.set_fragment(None);
+    let _ = url.set_username("");
+    let _ = url.set_password(None);
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1303,10 +1443,30 @@ impl Default for LibrarySnapshot {
 }
 
 impl LibrarySnapshot {
-    pub fn upsert_paper(&mut self, paper: Paper, domain: ResearchDomain) {
+    /// Adds a paper, or updates its stored copy. An update never loses evidence: a record
+    /// without a body keeps the stored body and known identifiers, and a record whose DOI,
+    /// PMID or PMCID contradicts the stored copy is refused (returns `false`), leaving the
+    /// stored copy as it was.
+    pub fn upsert_paper(&mut self, paper: Paper, domain: ResearchDomain) -> bool {
         let id = paper.id.clone();
         if let Some(existing) = self.papers.iter_mut().find(|p| p.id == id) {
-            *existing = paper;
+            if identifiers_conflict(existing, &paper) {
+                return false;
+            }
+            let mut incoming = paper;
+            if incoming.full_text.is_none() {
+                incoming.full_text = existing.full_text.take();
+            }
+            if incoming.doi.is_none() {
+                incoming.doi = existing.doi.take();
+            }
+            if incoming.pmid.is_none() {
+                incoming.pmid = existing.pmid.take();
+            }
+            if incoming.pmcid.is_none() {
+                incoming.pmcid = existing.pmcid.take();
+            }
+            *existing = incoming;
         } else {
             self.papers.push(paper);
         }
@@ -1318,6 +1478,16 @@ impl LibrarySnapshot {
         if !domains.contains(&domain) {
             domains.push(domain);
         }
+        true
+    }
+
+    /// Every stored copy of every paper (see `all_papers_mut`).
+    pub fn all_papers(&self) -> impl Iterator<Item = &Paper> {
+        self.papers
+            .iter()
+            .chain(self.pipeline.validations.iter().flat_map(|v| v.papers.iter()))
+            .chain(self.pipeline.cycles.iter().flat_map(|c| c.papers.iter()))
+            .chain(self.pipeline.connections.iter().flat_map(|c| c.papers.iter()))
     }
 
     /// Every stored copy of every paper: the library plus each validation, discovery cycle
@@ -1330,14 +1500,46 @@ impl LibrarySnapshot {
             .chain(self.pipeline.connections.iter_mut().flat_map(|c| c.papers.iter_mut()))
     }
 
-    /// Removes article bodies that may not be redistributed from every copy of every paper,
-    /// for exports. Metadata, checksums and verified quotations are kept.
+    /// Prepares the snapshot for export. For every paper whose body may not be
+    /// redistributed: its passages are removed from every stored copy, its download address
+    /// loses any capability parts, and quotations from it are capped per hypothesis or
+    /// claim at `RESTRICTED_QUOTE_ALLOWANCE`. Metadata and checksums are kept.
     pub fn redact_restricted_bodies(&mut self) {
+        let restricted: HashSet<String> = self
+            .all_papers()
+            .filter(|p| p.is_body_redistribution_restricted())
+            .map(|p| p.id.clone())
+            .collect();
         for paper in self.all_papers_mut() {
-            if paper.is_body_redistribution_restricted() {
+            if restricted.contains(&paper.id) {
                 if let Some(ref mut ft) = paper.full_text {
                     ft.passages.clear();
+                    strip_url_capability(&mut ft.source_url);
                 }
+            }
+        }
+        for item in &mut self.pipeline.queue {
+            cap_restricted_quotations(&mut item.draft.citations, &restricted);
+        }
+        for cycle in &mut self.pipeline.cycles {
+            for draft in &mut cycle.hypotheses {
+                cap_restricted_quotations(&mut draft.citations, &restricted);
+            }
+        }
+        for review in &mut self.pipeline.connections {
+            for proposal in &mut review.proposals {
+                cap_restricted_quotations(&mut proposal.draft.citations, &restricted);
+            }
+        }
+        for validation in &mut self.pipeline.validations {
+            for claim in &mut validation.claims {
+                cap_restricted_quotations(&mut claim.citations, &restricted);
+            }
+            if let Some(ref mut revision) = validation.proposed_revision {
+                cap_restricted_quotations(&mut revision.citations, &restricted);
+            }
+            if let Some(ref mut checks) = validation.supplied_citation_checks {
+                cap_restricted_quotations(checks, &restricted);
             }
         }
     }

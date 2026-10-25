@@ -52,6 +52,11 @@ fn owner_request_at(
         )
 }
 
+/// A workspace address: `rest` is relative to the workspace, as `AppState::private_path`.
+fn private(state: &AppState, rest: &str) -> String {
+    state.private_path(rest)
+}
+
 /// A paper whose stored body may not be redistributed, holding `sentinel` as its only passage.
 fn restricted_paper(id: &str, sentinel: &str) -> Paper {
     let source_url = Url::parse("https://www.ncbi.nlm.nih.gov/research/bionlp/RESTful/pmcoa.cgi/BioC_json/PMC6500498/unicode").unwrap();
@@ -342,13 +347,17 @@ async fn pages_send_origin_on_same_origin_form_posts() {
     // rejects; every button in the app then failed with 403.
     let page = app
         .clone()
-        .oneshot(owner_request(&state, Method::GET, "/").body(Body::empty()).expect("request"))
+        .oneshot(
+            owner_request(&state, Method::GET, &private(&state, ""))
+                .body(Body::empty())
+                .expect("request"),
+        )
         .await
         .expect("response");
     assert_eq!(page.status(), StatusCode::OK);
     assert_eq!(page.headers()[header::REFERRER_POLICY], "same-origin");
 
-    let null_origin = owner_request(&state, Method::POST, "/domain")
+    let null_origin = owner_request(&state, Method::POST, &private(&state, "domain"))
         .header(header::ORIGIN, "null")
         .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
         .body(Body::from("domain=cancer"))
@@ -392,12 +401,13 @@ async fn continue_with_chatgpt_redirects_to_openai_with_loopback_callback() {
     let (state, dir) = fresh_state();
     let csrf = state.csrf_token.clone();
     let session = state.session_token.clone();
+    let sign_in_path = private(&state, "chatgpt/sign-in");
     let app = build_router(state);
 
     let sign_in = move |host: &'static str, token: String| {
         Request::builder()
             .method(Method::POST)
-            .uri("/chatgpt/sign-in")
+            .uri(sign_in_path.as_str())
             .header(header::HOST, host)
             .header(header::COOKIE, format!("{SESSION_COOKIE}={session}"))
             .header(header::ORIGIN, format!("http://{host}"))
@@ -523,7 +533,7 @@ async fn loop_page_offers_automatic_model_and_explains_missing_providers() {
     let app = build_router(state.clone());
     let response = app
         .oneshot(
-            owner_request(&state, Method::GET, "/?section=loop")
+            owner_request(&state, Method::GET, &private(&state, "?section=loop"))
                 .body(Body::empty())
                 .expect("request"),
         )
@@ -617,7 +627,7 @@ async fn credentials_form_saves_valid_keys_and_explains_rejected_ones() {
     let response = app
         .clone()
         .oneshot(
-            owner_request(&state, Method::POST, "/credentials")
+            owner_request(&state, Method::POST, &private(&state, "credentials"))
                 .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
                 .body(Body::from(body))
                 .expect("request"),
@@ -630,7 +640,7 @@ async fn credentials_form_saves_valid_keys_and_explains_rejected_ones() {
 
     let page = app
         .oneshot(
-            owner_request(&state, Method::GET, "/?section=sources")
+            owner_request(&state, Method::GET, &private(&state, "?section=sources"))
                 .body(Body::empty())
                 .expect("request"),
         )
@@ -697,16 +707,31 @@ async fn local_clients_are_refused_until_the_start_link_is_opened() {
     };
 
     // Another local process can connect to the loopback port, but gets nothing without
-    // the session cookie: no page, no export, no event stream, no action.
-    for uri in ["/", "/?section=library", "/export/library.json", "/export/library.md", "/events"] {
+    // the session path and cookie: no page, no export, no event stream, no action.
+    let workspace = private(&state, "");
+    for rest in ["", "?section=library", "export/library.json", "export/library.md", "events"] {
+        let uri = private(&state, rest);
         let response = app
             .clone()
-            .oneshot(anonymous(Method::GET, uri).body(Body::empty()).expect("request"))
+            .oneshot(anonymous(Method::GET, &uri).body(Body::empty()).expect("request"))
             .await
             .expect("response");
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{uri}");
     }
-    let post = anonymous(Method::POST, "/domain")
+    // The bare root and unprefixed workspace addresses are not the workspace.
+    for uri in ["/", "/export/library.json", "/events", "/s/0123456789abcdef/"] {
+        let response = app
+            .clone()
+            .oneshot(
+                owner_request(&state, Method::GET, uri)
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{uri}");
+    }
+    let post = anonymous(Method::POST, &private(&state, "domain"))
         .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
         .body(Body::from(format!("csrf_token={csrf}&domain=cancer")))
         .expect("request");
@@ -742,7 +767,7 @@ async fn local_clients_are_refused_until_the_start_link_is_opened() {
         .await
         .expect("response");
     assert_eq!(started.status(), StatusCode::SEE_OTHER);
-    assert_eq!(started.headers()[header::LOCATION], "/");
+    assert_eq!(started.headers()[header::LOCATION], workspace.as_str());
     let cookie = started.headers()[header::SET_COOKIE].to_str().expect("cookie");
     assert!(cookie.starts_with(&format!("{SESSION_COOKIE}={}", state.session_token)));
     assert!(cookie.contains("HttpOnly") && cookie.contains("SameSite=Lax"));
@@ -753,7 +778,7 @@ async fn local_clients_are_refused_until_the_start_link_is_opened() {
         let response = app
             .clone()
             .oneshot(
-                owner_request_at(&state, Method::GET, "/", host)
+                owner_request_at(&state, Method::GET, &workspace, host)
                     .body(Body::empty())
                     .expect("request"),
             )
@@ -766,7 +791,7 @@ async fn local_clients_are_refused_until_the_start_link_is_opened() {
     let rebound = app
         .clone()
         .oneshot(
-            owner_request_at(&state, Method::GET, "/export/library.json", "research.attacker.example")
+            owner_request_at(&state, Method::GET, &private(&state, "export/library.json"), "research.attacker.example")
                 .body(Body::empty())
                 .expect("request"),
         )
@@ -776,7 +801,7 @@ async fn local_clients_are_refused_until_the_start_link_is_opened() {
     // So is a request with two Host headers, whichever comes first.
     let ambiguous = app
         .oneshot(
-            owner_request(&state, Method::GET, "/")
+            owner_request(&state, Method::GET, &workspace)
                 .header(header::HOST, "research.attacker.example")
                 .body(Body::empty())
                 .expect("request"),
@@ -803,7 +828,7 @@ async fn only_the_csrf_protected_post_switches_the_research_field() {
     let page = app
         .clone()
         .oneshot(
-            owner_request(&state, Method::GET, "/?domain=cancer&section=loop")
+            owner_request(&state, Method::GET, &private(&state, "?domain=cancer&section=loop"))
                 .body(Body::empty())
                 .expect("request"),
         )
@@ -821,7 +846,7 @@ async fn only_the_csrf_protected_post_switches_the_research_field() {
 
     let switched = app
         .oneshot(
-            owner_request(&state, Method::POST, "/domain")
+            owner_request(&state, Method::POST, &private(&state, "domain"))
                 .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
                 .body(Body::from(format!("csrf_token={csrf}&domain=cancer")))
                 .expect("request"),
@@ -943,7 +968,7 @@ async fn json_export_redacts_restricted_bodies_in_every_record() {
     let app = build_router(state.clone());
     let response = app
         .oneshot(
-            owner_request(&state, Method::GET, "/export/library.json")
+            owner_request(&state, Method::GET, &private(&state, "export/library.json"))
                 .body(Body::empty())
                 .expect("request"),
         )
@@ -1175,4 +1200,265 @@ fn xml_text_is_collected_once_per_text_node() {
     // The markup scan that guards the parser counts nesting, not angle brackets in other places.
     assert_eq!(xml_nesting_depth(r#"<a><!-- <x><y> --><b attr="<c><d>"><![CDATA[<e><f><g>]]><?pi <h>?><i/></b></a>"#), 2);
     assert_eq!(xml_nesting_depth("<a><b><c></c></b><d/></a>"), 3);
+}
+
+#[test]
+fn deduplicator_never_bridges_records_whose_identifiers_disagree() {
+    let a = Paper {
+        id: "MED:A".to_string(),
+        title: "Paper A".to_string(),
+        doi: Some("10.1000/a".to_string()),
+        pmid: Some("1".to_string()),
+        ..Paper::default()
+    };
+    let b = Paper {
+        id: "MED:B".to_string(),
+        title: "Paper B".to_string(),
+        doi: Some("10.1000/b".to_string()),
+        pmid: Some("2".to_string()),
+        ..Paper::default()
+    };
+    // Shares A's DOI and B's PMID: it disagrees with each on the other identifier.
+    let bridge = Paper {
+        id: "PMC:X".to_string(),
+        title: "Bridge".to_string(),
+        doi: Some("10.1000/a".to_string()),
+        pmid: Some("2".to_string()),
+        ..Paper::default()
+    };
+    let merged = PaperDeduplicator::deduplicate(&[a.clone(), bridge.clone(), b.clone()]);
+    assert_eq!(merged.len(), 3, "{merged:?}");
+
+    // A bridge that agrees with A (shared PMCID, nothing contradicted) merges into A, but
+    // the merged record then carries A's DOI and so never merges with B through the PMID.
+    let a_without_pmid = Paper { pmid: None, pmcid: Some("PMC100".to_string()), ..a.clone() };
+    let b_with_pmcid = Paper { pmcid: Some("PMC200".to_string()), ..b.clone() };
+    let bridge2 = Paper { doi: None, pmid: Some("2".to_string()), pmcid: Some("PMC100".to_string()), ..bridge.clone() };
+    let merged = PaperDeduplicator::deduplicate(&[a_without_pmid, bridge2, b_with_pmcid]);
+    assert_eq!(merged.len(), 2, "{merged:?}");
+    assert!(merged.iter().any(|p| p.id == "MED:A" && p.pmid.as_deref() == Some("2")));
+    assert!(merged.iter().any(|p| p.id == "MED:B" && p.doi.as_deref() == Some("10.1000/b")));
+}
+
+#[test]
+fn paper_updates_keep_evidence_and_refuse_a_conflicting_identity() {
+    use dementia_research_web::models::LibrarySnapshot;
+
+    let body = restricted_paper("MED:1", "Stored body text that must survive a metadata refresh.");
+    let mut lib = LibrarySnapshot::default();
+    assert!(lib.upsert_paper(body.clone(), ResearchDomain::Dementia));
+
+    // A search record for the same paper has no body; the stored body is kept.
+    let refreshed = Paper {
+        id: "MED:1".to_string(),
+        title: "Updated title".to_string(),
+        pmcid: Some("PMC6500498".to_string()),
+        is_open_access: false,
+        is_author_manuscript: true,
+        ..Paper::default()
+    };
+    assert!(lib.upsert_paper(refreshed, ResearchDomain::Dementia));
+    let stored = &lib.papers[0];
+    assert_eq!(stored.title, "Updated title");
+    assert!(stored.full_text.is_some(), "the body was discarded");
+
+    // A record that names a different paper under the same ID is refused outright.
+    let impostor = Paper {
+        id: "MED:1".to_string(),
+        title: "Another paper".to_string(),
+        pmcid: Some("PMC999".to_string()),
+        ..Paper::default()
+    };
+    assert!(!lib.upsert_paper(impostor, ResearchDomain::Dementia));
+    assert_eq!(lib.papers.len(), 1);
+    assert_eq!(lib.papers[0].title, "Updated title");
+    assert_eq!(lib.papers[0].pmcid.as_deref(), Some("PMC6500498"));
+}
+
+#[test]
+fn elsevier_parser_extracts_each_paragraph_once() {
+    use dementia_research_web::parsers::ElsevierArticleParser;
+
+    let big = "lorem ipsum ".repeat(10_000); // ~120 KB
+    let depth = 200;
+    let xml = format!(
+        r#"<full-text-retrieval-response xmlns:prism="http://prismstandard.org/namespaces/basic/2.0/"><coredata><prism:doi>10.1016/j.test.2024.001</prism:doi></coredata><originalText>{}{big}{}</originalText></full-text-retrieval-response>"#,
+        "<para>".repeat(depth),
+        "</para>".repeat(depth)
+    );
+    let url = Url::parse("https://api.elsevier.com/content/article/doi/10.1016/j.test.2024.001").unwrap();
+    let parsed = ElsevierArticleParser::parse(xml.as_bytes(), url, "10.1016/j.test.2024.001", "tdm").expect("parsed");
+    // One passage holding the text once, not two hundred copies of it.
+    assert_eq!(parsed.passages.len(), 1);
+    let total: usize = parsed.passages.iter().map(|p| p.text.len()).sum();
+    assert!(total < 2 * big.len(), "{total}");
+}
+
+#[test]
+fn licence_markers_count_only_as_whole_unnegated_words_or_creative_commons_links() {
+    use dementia_research_web::models::{classify_license_text, classify_license_url, license_permits_redistribution, LicenseClass};
+
+    assert_eq!(classify_license_text("This is an open access article distributed under the terms of the Creative Commons Attribution 4.0 License"), LicenseClass::Open);
+    assert_eq!(classify_license_text("cc by-nc-nd"), LicenseClass::Open);
+    assert_eq!(classify_license_text("Not licensed under CC BY; copying prohibited"), LicenseClass::Restricted);
+    assert_eq!(classify_license_text("No Creative Commons Attribution licence applies to this article"), LicenseClass::Unknown);
+    assert_eq!(classify_license_text("This article is not public domain"), LicenseClass::Unknown);
+    assert_eq!(classify_license_text("Access requires a subscription"), LicenseClass::Restricted);
+    assert_eq!(classify_license_text("Licence: https://creativecommons.org/licenses/by/4.0/."), LicenseClass::Open);
+    assert_eq!(classify_license_text("Licence: https://notcreativecommons.org/licenses/by/4.0/"), LicenseClass::Unknown);
+    assert_eq!(classify_license_text("See https://publisher.example/terms?ref=creativecommons.org/licenses/by/"), LicenseClass::Unknown);
+    assert_eq!(classify_license_text("ccby"), LicenseClass::Unknown);
+
+    assert_eq!(classify_license_url(&Url::parse("https://creativecommons.org/licenses/by/4.0/").unwrap()), LicenseClass::Open);
+    assert_eq!(classify_license_url(&Url::parse("http://www.creativecommons.org/publicdomain/zero/1.0/").unwrap()), LicenseClass::Open);
+    assert_eq!(classify_license_url(&Url::parse("https://notcreativecommons.org/licenses/by/4.0/").unwrap()), LicenseClass::Unknown);
+    assert_eq!(classify_license_url(&Url::parse("https://evil.example/x?u=creativecommons.org/licenses/by/").unwrap()), LicenseClass::Unknown);
+    assert_eq!(classify_license_url(&Url::parse("https://creativecommons.org/about").unwrap()), LicenseClass::Unknown);
+
+    // Mixed statements: any restriction wins; a misleading URL alone permits nothing.
+    assert!(license_permits_redistribution(["cc by"], Some(&Url::parse("https://creativecommons.org/licenses/by/4.0/").unwrap())));
+    assert!(!license_permits_redistribution(["cc by", "all rights reserved"], None));
+    assert!(!license_permits_redistribution(["see publisher"], Some(&Url::parse("https://notcreativecommons.org/licenses/by/4.0/").unwrap())));
+    assert!(!license_permits_redistribution(["Not licensed under CC BY"], None));
+}
+
+#[tokio::test]
+async fn tdm_redirect_hosts_must_resolve_to_public_addresses() {
+    use dementia_research_web::literature::{is_public_ip, resolve_public_addresses, tdm_destination_allowed};
+    use std::net::IpAddr;
+
+    for public in ["93.184.216.34", "2606:2800:220:1:248:1893:25c8:1946", "8.8.8.8"] {
+        assert!(is_public_ip(public.parse::<IpAddr>().unwrap()), "{public}");
+    }
+    for private in [
+        "127.0.0.1", "10.1.2.3", "172.16.5.5", "192.168.0.1", "169.254.169.254", "100.64.0.1",
+        "0.0.0.0", "224.0.0.1", "240.0.0.1", "192.0.0.8", "::1", "fe80::1", "fd00::1", "fc00::1",
+        "::ffff:10.0.0.1", "2001:db8::1", "64:ff9b::a00:1", "ff02::1",
+    ] {
+        assert!(!is_public_ip(private.parse::<IpAddr>().unwrap()), "{private}");
+    }
+    assert!(!tdm_destination_allowed(&Url::parse("https://localhost/x").unwrap()));
+    assert!(!tdm_destination_allowed(&Url::parse("https://api.localhost/x").unwrap()));
+    // The system resolver answers for localhost without a network; its answer is loopback.
+    assert!(resolve_public_addresses("localhost").await.is_err());
+}
+
+#[test]
+fn exported_restricted_sources_keep_no_capability_urls_and_cap_quotations() {
+    use dementia_research_web::models::{strip_url_capability, LibrarySnapshot, HypothesisDraft, HypothesisOrigin, QueuedHypothesis, QUOTE_NOT_REPRODUCED};
+
+    let mut signed = Url::parse("https://user:pw@cdn.example/article.xml?token=secret&x=1#frag").unwrap();
+    strip_url_capability(&mut signed);
+    assert_eq!(signed.as_str(), "https://cdn.example/article.xml");
+
+    let body = "sentence ".repeat(120);
+    let mut paper = restricted_paper("MED:4", body.trim());
+    paper.full_text.as_mut().unwrap().source_url = Url::parse("https://cdn.example/x?token=secret").unwrap();
+    let quote = "sentence ".repeat(44).trim().to_string();
+    let mut draft = HypothesisDraft::minimal("Title", "Statement under test");
+    draft.citations = (0..3)
+        .map(|i| EvidenceCitation::new("MED:4", "body-1", &quote, &format!("interpretation {i}")))
+        .collect();
+    let mut lib = LibrarySnapshot::default();
+    lib.papers.push(paper);
+    lib.pipeline.enqueue(QueuedHypothesis::new(draft, HypothesisOrigin::Manual, ResearchDomain::Dementia));
+    lib.redact_restricted_bodies();
+    let json = serde_json::to_string(&lib).unwrap();
+    assert!(!json.contains("token=secret"));
+    assert!(json.contains("https://cdn.example/x"));
+    assert_eq!(json.matches(&quote).count(), 2);
+    assert_eq!(json.matches(QUOTE_NOT_REPRODUCED).count(), 1);
+    assert!(!json.contains(body.trim()));
+}
+
+#[test]
+fn generated_text_may_not_copy_restricted_sources_outside_citations() {
+    use dementia_research_web::citation::EvidenceDocument;
+    use dementia_research_web::models::{HypothesisDraft, ResearchError};
+
+    let restricted_text = "The study found that microglial activation increased markedly after exposure to the compound in every cohort examined over twelve months of follow up.";
+    let open_text = "Independent work reported comparable increases in astrocyte reactivity after the same exposure in a separate population.";
+    let document = |id: &str, text: &str, restricted: bool| EvidenceDocument {
+        paper_id: id.to_string(),
+        title: id.to_string(),
+        evidence_type: "selected article-body excerpts (not the entire paper)".to_string(),
+        is_preprint: false,
+        passages: vec![Passage { id: "body-1".to_string(), section: "Results".to_string(), text: text.to_string() }],
+        checksum: Some("c".to_string()),
+        restricted,
+    };
+    let documents = vec![document("MED:R", restricted_text, true), document("MED:O", open_text, false)];
+
+    let mut draft = HypothesisDraft::minimal("Microglia and the compound", "Exposure to the compound raises microglial activation.");
+    for field in [&mut draft.r#type, &mut draft.scope, &mut draft.next_test, &mut draft.novelty, &mut draft.support, &mut draft.importance, &mut draft.originality, &mut draft.feasibility] {
+        *field = "stated".to_string();
+    }
+    draft.necessary_claims = vec!["Activation rises after exposure.".to_string()];
+    draft.predictions = vec!["Markers rise.".to_string(), "Markers fall after withdrawal.".to_string()];
+    draft.falsification_criteria = vec!["No change in markers.".to_string()];
+    draft.alternatives = vec!["Batch effects.".to_string()];
+    draft.citations = vec![
+        EvidenceCitation::new("MED:R", "body-1", "microglial activation increased markedly after exposure", "Supports the rise."),
+        EvidenceCitation::new("MED:O", "body-1", "comparable increases in astrocyte reactivity", "A second cell type."),
+    ];
+
+    // Copying a restricted passage into the rationale is refused with a repair message.
+    draft.rationale = format!("As the paper says, {restricted_text}");
+    let err = EvidenceValidator::validate_discovery_draft(draft.clone(), &documents).unwrap_err();
+    assert!(matches!(&err, ResearchError::InvalidResponse(m) if m.contains("copies article text verbatim")), "{err}");
+
+    // The same words from the open source are allowed, and the rewritten draft passes.
+    draft.rationale = format!("Reported elsewhere: {open_text}");
+    let accepted = EvidenceValidator::validate_discovery_draft(draft, &documents).expect("accepted");
+    assert!(accepted.citations.iter().all(EvidenceCitation::is_verified));
+}
+
+#[tokio::test]
+async fn workspace_links_resolve_under_the_session_base() {
+    use axum::body::Body;
+    use dementia_research_web::web::build_router;
+    use http_body_util::BodyExt;
+    use tower::ServiceExt;
+
+    let (state, dir) = fresh_state();
+    let app = build_router(state.clone());
+    let page = app
+        .clone()
+        .oneshot(owner_request(&state, Method::GET, &private(&state, "?section=library")).body(Body::empty()).expect("request"))
+        .await
+        .expect("response");
+    let html = String::from_utf8(page.into_body().collect().await.expect("body").to_bytes().to_vec()).expect("utf8");
+    assert!(html.contains(&format!(r#"<base href="{}">"#, private(&state, ""))));
+    assert!(html.contains(r#"action="domain""#) && html.contains(r#"href="export/library.json""#));
+    assert!(!html.contains(r#"action="/"#) && !html.contains(r#"href="/?section"#));
+    assert!(html.contains(r#"href="/static/app.css""#));
+
+    let script = app
+        .oneshot(Request::get("/static/app.js").header(header::HOST, "127.0.0.1:8080").body(Body::empty()).expect("request"))
+        .await
+        .expect("response");
+    let js = String::from_utf8(script.into_body().collect().await.expect("body").to_bytes().to_vec()).expect("utf8");
+    assert!(js.contains(r#"new EventSource("events")"#) && !js.contains(r#""/events""#));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn gdc_cancer_types_are_deduplicated_in_linear_time_and_capped() {
+    use dementia_research_web::datasets::CancerDatasetClient;
+
+    // 40,000 distinct short values in one project: well under 2 MiB, but quadratic
+    // membership tests would take minutes.
+    let sites: Vec<String> = (0..40_000).map(|i| format!("\"site {i}\"")).collect();
+    let json = format!(
+        r#"{{"data":{{"hits":[{{"project_id":"TCGA-X","name":"Glioma study","primary_site":[{}],"disease_type":["Glioma"],"summary":{{"case_count":10,"file_count":5}}}}]}}}}"#,
+        sites.join(",")
+    );
+    let url = Url::parse("https://api.gdc.cancer.gov/projects").unwrap();
+    let started = std::time::Instant::now();
+    let (records, total) = CancerDatasetClient::parse_gdc_projects(json.as_bytes(), &["glioma".to_string()], 8, &url, Utc::now()).expect("parsed");
+    assert!(started.elapsed() < std::time::Duration::from_secs(5), "{:?}", started.elapsed());
+    assert_eq!(total, 1);
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].cancer_types.len(), 64);
+    assert_eq!(records[0].cancer_types[0], "Glioma");
 }

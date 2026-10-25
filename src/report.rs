@@ -8,8 +8,8 @@ use url::Url;
 
 /// Characters of verified quotation one hypothesis or claim may reproduce from a paper
 /// whose body is not redistributable. Later quotations from that paper are listed by
-/// passage but not reproduced.
-pub const RESTRICTED_QUOTE_ALLOWANCE: usize = 1_000;
+/// passage but not reproduced. The JSON export applies the same allowance.
+pub use crate::models::RESTRICTED_QUOTE_ALLOWANCE;
 
 const SCOPE_DISCLAIMER: &str = "Exploratory research record. Literature support is not experimental validation, a statistical correlation or a patient-specific treatment recommendation.";
 

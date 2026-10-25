@@ -94,6 +94,19 @@ impl AppState {
         format!("http://{addr}/?token={}", self.bootstrap_token)
     }
 
+    /// The path prefix every private route is served under: `/s/<session token>`. A page
+    /// on another port of this host never learns it (`Referrer-Policy: same-origin`), so a
+    /// cookie leaked to such a page cannot be replayed on its own.
+    pub fn session_prefix(&self) -> String {
+        format!("/s/{}", self.session_token)
+    }
+
+    /// A private route's address. `rest` is relative to the workspace: `""`,
+    /// `"?section=loop"` or `"export/library.json"`.
+    pub fn private_path(&self, rest: &str) -> String {
+        format!("{}/{rest}", self.session_prefix())
+    }
+
     fn provider_access(&self) -> ProviderAccess<'_> {
         ProviderAccess {
             keychain: &self.keychain,
@@ -112,31 +125,39 @@ impl AppState {
     }
 }
 
+/// Where the workspace lives; the segment must equal the session token.
+const SESSION_MOUNT: &str = "/s/{session}";
+
 pub fn build_router(state: Arc<AppState>) -> Router {
+    // Private routes are registered one by one under the session prefix (rather than
+    // nested) so that the workspace root matches with its trailing slash, which the
+    // page's `<base>` and every relative link rely on.
+    let at = |rest: &str| format!("{SESSION_MOUNT}/{rest}");
     Router::new()
-        .route("/", get(index_handler))
+        .route("/", get(root_handler))
         .route("/static/app.css", get(stylesheet_handler))
         .route("/static/app.js", get(script_handler))
-        .route("/events", get(events_handler))
-        .route("/domain", post(switch_domain_handler))
-        .route("/objectives", post(objectives_handler))
-        .route("/queue/manual", post(enqueue_manual_handler))
-        .route("/literature/search", post(literature_search_handler))
-        .route("/papers/retrieve", post(retrieve_paper_handler))
-        .route("/datasets/discover", post(discover_datasets_handler))
-        .route("/loop/discover", post(run_discovery_handler))
-        .route("/loop/validate", post(run_validation_handler))
-        .route("/loop/connect", post(run_connection_handler))
-        .route("/credentials", post(save_credentials_handler))
-        .route("/chatgpt/sign-in", post(chatgpt_sign_in_handler))
         .route(CALLBACK_PATH, get(chatgpt_callback_handler))
-        .route("/chatgpt/sign-out", post(chatgpt_sign_out_handler))
-        .route("/chatgpt/welcome", post(chatgpt_welcome_handler))
-        .route("/export/library.md", get(export_library_md_handler))
-        .route("/export/library.txt", get(export_library_txt_handler))
-        .route("/export/library.json", get(export_library_json_handler))
-        .route("/export/paper/{id}", get(export_paper_md_handler))
-        .route("/export/validation/{id}", get(export_validation_md_handler))
+        .route(&at(""), get(index_handler))
+        .route(&at("events"), get(events_handler))
+        .route(&at("domain"), post(switch_domain_handler))
+        .route(&at("objectives"), post(objectives_handler))
+        .route(&at("queue/manual"), post(enqueue_manual_handler))
+        .route(&at("literature/search"), post(literature_search_handler))
+        .route(&at("papers/retrieve"), post(retrieve_paper_handler))
+        .route(&at("datasets/discover"), post(discover_datasets_handler))
+        .route(&at("loop/discover"), post(run_discovery_handler))
+        .route(&at("loop/validate"), post(run_validation_handler))
+        .route(&at("loop/connect"), post(run_connection_handler))
+        .route(&at("credentials"), post(save_credentials_handler))
+        .route(&at("chatgpt/sign-in"), post(chatgpt_sign_in_handler))
+        .route(&at("chatgpt/sign-out"), post(chatgpt_sign_out_handler))
+        .route(&at("chatgpt/welcome"), post(chatgpt_welcome_handler))
+        .route(&at("export/library.md"), get(export_library_md_handler))
+        .route(&at("export/library.txt"), get(export_library_txt_handler))
+        .route(&at("export/library.json"), get(export_library_json_handler))
+        .route(&at("export/paper/{id}"), get(export_paper_md_handler))
+        .route(&at("export/validation/{id}"), get(export_validation_md_handler))
         .layer(DefaultBodyLimit::max(256 * 1024))
         .layer(middleware::from_fn_with_state(
             Arc::clone(&state),
@@ -148,8 +169,9 @@ pub fn build_router(state: Arc<AppState>) -> Router {
 /// Checks every request before it reaches a handler, then adds the security headers to
 /// every response:
 /// 1. the `Host` must be this server's loopback address (no DNS-rebound names);
-/// 2. apart from the stylesheet, script and OAuth callback, the request must carry the
-///    session cookie, which only the start link sets;
+/// 2. apart from the start page, stylesheet, script and OAuth callback, the request must be
+///    under the session path and carry the session cookie, both of which only the start
+///    link establishes;
 /// 3. a `POST` must come from this origin.
 async fn request_guard_middleware(
     State(state): State<Arc<AppState>>,
@@ -170,21 +192,17 @@ async fn guard_request(state: &AppState, req: Request<Body>, next: Next) -> Resp
             .into_response();
     }
     let path = req.uri().path();
-    // The stylesheet and script hold nothing private; the OAuth callback is bound to the
-    // pending sign-in by its `state` value and may arrive without the cookie when the
-    // sign-in was started from `localhost` rather than `127.0.0.1`.
-    if path.starts_with("/static/") || path == CALLBACK_PATH {
+    // The start page checks the start-link token itself; the stylesheet and script hold
+    // nothing private; the OAuth callback is bound to the pending sign-in by its `state`
+    // value and may arrive without the cookie when the sign-in was started from
+    // `localhost` rather than `127.0.0.1`.
+    if path == "/" || path.starts_with("/static/") || path == CALLBACK_PATH {
         return next.run(req).await;
     }
-    if req.method() == Method::GET && path == "/" {
-        if let Some(token) = query_value(req.uri().query(), "token") {
-            if verify_csrf(&state.bootstrap_token, &token) {
-                return start_session_response(state);
-            }
-            return unauthorized_response(req.method());
-        }
-    }
-    if !has_session_cookie(req.headers(), &state.session_token) {
+    // Everything else is the workspace: the session path and the session cookie are both
+    // required, so neither a leaked cookie nor a leaked address is enough on its own.
+    let path_ok = session_segment(path).is_some_and(|s| verify_csrf(&state.session_token, s));
+    if !path_ok || !has_session_cookie(req.headers(), &state.session_token) {
         return unauthorized_response(req.method());
     }
     if req.method() == Method::POST && !same_origin_allowed(req.headers()) {
@@ -197,10 +215,30 @@ async fn guard_request(state: &AppState, req: Request<Body>, next: Next) -> Resp
     next.run(req).await
 }
 
-/// Sets the session cookie and sends the browser to the workspace without the token in
-/// its address bar or history.
+/// The session token segment of a workspace path (`/s/<token>/...`).
+fn session_segment(path: &str) -> Option<&str> {
+    path.strip_prefix("/s/")
+        .map(|rest| rest.split('/').next().unwrap_or(""))
+}
+
+#[derive(Deserialize, Default)]
+struct StartQuery {
+    token: Option<String>,
+}
+
+/// The start page: with the start link's token it begins the owner's session; anything
+/// else is told where the start link is.
+async fn root_handler(State(state): State<Arc<AppState>>, Query(query): Query<StartQuery>) -> Response {
+    match query.token {
+        Some(token) if verify_csrf(&state.bootstrap_token, &token) => start_session_response(&state),
+        _ => unauthorized_response(&Method::GET),
+    }
+}
+
+/// Sets the session cookie and sends the browser to the workspace, under the session path,
+/// without the start-link token in its address bar or history.
 fn start_session_response(state: &AppState) -> Response {
-    let mut res = Redirect::to("/").into_response();
+    let mut res = Redirect::to(&state.private_path("")).into_response();
     let cookie = format!(
         "{SESSION_COOKIE}={}; Path=/; HttpOnly; SameSite=Lax",
         state.session_token
@@ -218,8 +256,8 @@ fn unauthorized_response(method: &Method) -> Response {
 <link rel="stylesheet" href="/static/app.css"></head>
 <body><main class="content">
 <h1>Open the app from its start link</h1>
-<p>This page is only shown to the browser that opened the start link printed in the
-terminal when the app started. Copy that link (it ends in <code>?token=…</code>) into
+<p>The workspace is only shown to the browser that opened the start link printed in the
+terminal when the app started, at the address that link leads to. Copy that link (it ends in <code>?token=…</code>) into
 this browser, or restart the app to print a new one.</p>
 </main></body></html>"#;
         (StatusCode::UNAUTHORIZED, Html(page)).into_response()
@@ -230,13 +268,6 @@ this browser, or restart the app to print a new one.</p>
         )
             .into_response()
     }
-}
-
-/// The value of `key` in a query string, if present.
-fn query_value(query: Option<&str>, key: &str) -> Option<String> {
-    url::form_urlencoded::parse(query?.as_bytes())
-        .find(|(k, _)| k == key)
-        .map(|(_, v)| v.into_owned())
 }
 
 /// Whether a `Cookie` header carries the session cookie with the expected value.
@@ -392,6 +423,7 @@ async fn index_handler(
 
     Html(render_workspace(
         &lib,
+        &state.private_path(""),
         section,
         &state.csrf_token,
         flash.as_deref(),
@@ -544,7 +576,7 @@ async fn switch_domain_handler(
         let _ = state.store.save(&lib);
     }
     let sec = form.section.as_deref().unwrap_or("loop");
-    Redirect::to(&format!("/?section={}", urlencoding::encode(sec))).into_response()
+    Redirect::to(&state.private_path(&format!("?section={}", urlencoding::encode(sec)))).into_response()
 }
 
 #[derive(Deserialize)]
@@ -571,7 +603,7 @@ async fn objectives_handler(
         state.set_flash("Added research objective to queue.").await;
     }
     let _ = state.store.save(&lib);
-    Redirect::to("/?section=loop").into_response()
+    Redirect::to(&state.private_path("?section=loop")).into_response()
 }
 
 #[derive(Deserialize)]
@@ -601,7 +633,7 @@ async fn enqueue_manual_handler(
             state.set_flash(format!("Could not queue hypothesis: {e}")).await;
         }
     }
-    Redirect::to("/?section=queue").into_response()
+    Redirect::to(&state.private_path("?section=queue")).into_response()
 }
 
 #[derive(Deserialize)]
@@ -627,6 +659,8 @@ async fn literature_search_handler(
             for p in res.papers {
                 lib.upsert_paper(p, domain);
             }
+            // Metadata may have changed under existing citations.
+            LibraryStore::reverify_all_citations(&mut lib);
             lib.pipeline.record(format!(
                 "Literature search '{}' returned {count} deduplicated eligible records.",
                 form.query.trim()
@@ -643,7 +677,7 @@ async fn literature_search_handler(
             state.set_flash(format!("Literature search failed: {e}")).await;
         }
     }
-    Redirect::to("/?section=library").into_response()
+    Redirect::to(&state.private_path("?section=library")).into_response()
 }
 
 #[derive(Deserialize)]
@@ -668,7 +702,7 @@ async fn retrieve_paper_handler(
     };
     let Some(mut paper) = paper_opt else {
         state.set_flash("Paper ID not found in library.").await;
-        return Redirect::to("/?section=library").into_response();
+        return Redirect::to(&state.private_path("?section=library")).into_response();
     };
     let access = state.keychain.institutional_access();
     let ft_client = FreeFullTextClient::default();
@@ -694,7 +728,7 @@ async fn retrieve_paper_handler(
                 .await;
         }
     }
-    Redirect::to("/?section=library").into_response()
+    Redirect::to(&state.private_path("?section=library")).into_response()
 }
 
 #[derive(Deserialize)]
@@ -736,7 +770,7 @@ async fn discover_datasets_handler(
                 .await;
         }
     }
-    Redirect::to("/?section=datasets").into_response()
+    Redirect::to(&state.private_path("?section=datasets")).into_response()
 }
 
 #[derive(Deserialize)]
@@ -887,7 +921,7 @@ async fn chatgpt_sign_in_handler(
         state
             .set_flash("Sign in with ChatGPT from a browser on the computer running this app (http://127.0.0.1).")
             .await;
-        return Redirect::to("/?section=sources").into_response();
+        return Redirect::to(&state.private_path("?section=sources")).into_response();
     };
     match state
         .chatgpt
@@ -897,7 +931,7 @@ async fn chatgpt_sign_in_handler(
         Ok(url) => Redirect::to(url.as_str()).into_response(),
         Err(e) => {
             state.set_flash(format!("Could not start ChatGPT sign-in: {e}")).await;
-            Redirect::to("/?section=sources").into_response()
+            Redirect::to(&state.private_path("?section=sources")).into_response()
         }
     }
 }
@@ -922,7 +956,7 @@ async fn chatgpt_callback_handler(
         Err(e) => format!("ChatGPT sign-in did not complete: {e}"),
     };
     state.set_flash(message).await;
-    Redirect::to("/?section=sources").into_response()
+    Redirect::to(&state.private_path("?section=sources")).into_response()
 }
 
 async fn chatgpt_sign_out_handler(
@@ -940,7 +974,7 @@ async fn chatgpt_sign_out_handler(
         Err(e) => format!("ChatGPT sign-out failed: {e}"),
     };
     state.set_flash(message).await;
-    Redirect::to("/?section=sources").into_response()
+    Redirect::to(&state.private_path("?section=sources")).into_response()
 }
 
 async fn chatgpt_welcome_handler(
@@ -957,24 +991,25 @@ async fn chatgpt_welcome_handler(
         .section
         .filter(|s| !s.is_empty() && s.chars().all(|c| c.is_ascii_lowercase()))
         .unwrap_or_else(|| "loop".to_string());
-    Redirect::to(&format!("/?section={section}")).into_response()
+    Redirect::to(&state.private_path(&format!("?section={section}"))).into_response()
 }
 
 /// Where to send the browser back to: the workspace section it came from (same-origin
 /// `Referer`), else `fallback`.
-fn back_to(headers: &HeaderMap, fallback: &str) -> String {
+fn back_to(state: &AppState, headers: &HeaderMap, fallback: &str) -> String {
+    let workspace = state.private_path("");
     let section = headers
         .get(header::REFERER)
         .and_then(|v| v.to_str().ok())
         .and_then(|raw| url::Url::parse(raw).ok())
-        .filter(|u| u.path() == "/")
+        .filter(|u| u.path() == workspace)
         .and_then(|u| {
             u.query_pairs()
                 .find(|(k, _)| k == "section")
                 .map(|(_, v)| v.into_owned())
         })
         .filter(|s| !s.is_empty() && s.chars().all(|c| c.is_ascii_lowercase()));
-    format!("/?section={}", section.as_deref().unwrap_or(fallback))
+    state.private_path(&format!("?section={}", section.as_deref().unwrap_or(fallback)))
 }
 
 /// Literature search and full-text retrieval for an agent, reporting each step.
@@ -1031,7 +1066,7 @@ async fn after_start(
     if let Err(e) = started {
         state.set_flash(e).await;
     }
-    Redirect::to(&back_to(headers, fallback)).into_response()
+    Redirect::to(&back_to(state, headers, fallback)).into_response()
 }
 
 async fn run_discovery_handler(
@@ -1046,7 +1081,7 @@ async fn run_discovery_handler(
         Ok(selection) => selection,
         Err(e) => {
             state.set_flash(format!("Cannot start discovery: {e}")).await;
-            return Redirect::to(&back_to(&headers, "loop")).into_response();
+            return Redirect::to(&back_to(&state, &headers, "loop")).into_response();
         }
     };
     let requested_objective = form.objective.clone().filter(|s| !s.trim().is_empty());
@@ -1136,13 +1171,13 @@ async fn run_validation_handler(
         state
             .set_flash("No queued hypothesis found to validate.")
             .await;
-        return Redirect::to(&back_to(&headers, "queue")).into_response();
+        return Redirect::to(&back_to(&state, &headers, "queue")).into_response();
     };
     let selection = match select_model(&state, &form.vendor, form.model.as_deref()).await {
         Ok(selection) => selection,
         Err(e) => {
             state.set_flash(format!("Cannot start validation: {e}")).await;
-            return Redirect::to(&back_to(&headers, "queue")).into_response();
+            return Redirect::to(&back_to(&state, &headers, "queue")).into_response();
         }
     };
     let app = Arc::clone(&state);
@@ -1210,7 +1245,7 @@ async fn run_connection_handler(
             state
                 .set_flash(format!("Cannot start connection review: {e}"))
                 .await;
-            return Redirect::to(&back_to(&headers, "connections")).into_response();
+            return Redirect::to(&back_to(&state, &headers, "connections")).into_response();
         }
     };
     let domain = state.library.read().await.pipeline.settings.domain();
@@ -1391,7 +1426,7 @@ async fn save_credentials_handler(
         messages.push("Nothing to save: every field was left blank.".to_string());
     }
     state.set_flash(messages.join(" ")).await;
-    Redirect::to("/?section=sources").into_response()
+    Redirect::to(&state.private_path("?section=sources")).into_response()
 }
 
 async fn export_library_md_handler(State(state): State<Arc<AppState>>) -> Response {
@@ -1450,7 +1485,7 @@ async fn export_library_json_handler(State(state): State<Arc<AppState>>) -> Resp
 
 async fn export_paper_md_handler(
     State(state): State<Arc<AppState>>,
-    Path(id): Path<String>,
+    Path((_session, id)): Path<(String, String)>,
 ) -> Response {
     let lib = state.library.read().await;
     let Some(paper) = lib.papers.iter().find(|p| p.id == id) else {
@@ -1466,7 +1501,7 @@ async fn export_paper_md_handler(
 
 async fn export_validation_md_handler(
     State(state): State<Arc<AppState>>,
-    Path(id): Path<String>,
+    Path((_session, id)): Path<(String, String)>,
 ) -> Response {
     let lib = state.library.read().await;
     let Ok(uuid) = Uuid::parse_str(&id) else {
@@ -1493,6 +1528,7 @@ async fn stylesheet_handler() -> Response {
 
 fn render_workspace(
     lib: &LibrarySnapshot,
+    base: &str,
     section: &str,
     csrf_token: &str,
     flash: Option<&str>,
@@ -1551,7 +1587,7 @@ fn render_workspace(
     for (id, label, count) in nav_items {
         let active = if section == id { " class=\"active\"" } else { "" };
         nav_html.push_str(&format!(
-            r#"<li><a href="/?section={id}"{active}><span>{}</span><span class="badge">{count}</span></a></li>"#,
+            r#"<li><a href="?section={id}"{active}><span>{}</span><span class="badge">{count}</span></a></li>"#,
             html_escape(label)
         ));
     }
@@ -1586,7 +1622,7 @@ fn render_workspace(
             r#"<div class="alert">
         <strong>You're using your ChatGPT plan</strong>
         <p>Model stages in this app now count toward your ChatGPT plan's usage. <a href="{MANAGE_USAGE_URL}" rel="noopener noreferrer" target="_blank">Manage usage</a></p>
-        <form method="post" action="/chatgpt/welcome">
+        <form method="post" action="chatgpt/welcome">
           <input type="hidden" name="csrf_token" value="{}">
           <input type="hidden" name="section" value="{}">
           <button type="submit" class="btn-secondary btn-small">Got it</button>
@@ -1624,6 +1660,7 @@ fn render_workspace(
 <html lang="en">
 <head>
   <meta charset="utf-8">
+  <base href="{}">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{} Medical Research Agent — Hardened Rust/Axum SSR</title>
   <link rel="stylesheet" href="/static/app.css">
@@ -1636,7 +1673,7 @@ fn render_workspace(
         <h1>Medical Research</h1>
         <p class="subtitle">Rust + Axum SSR · <code>#![forbid(unsafe_code)]</code> · <code>rustls</code></p>
       </div>
-      <form method="post" action="/domain" class="domain-switcher">
+      <form method="post" action="domain" class="domain-switcher">
         <input type="hidden" name="csrf_token" value="{csrf_escaped}">
         <input type="hidden" name="section" value="{}">
         <label for="domain-select">Research field</label>
@@ -1654,9 +1691,9 @@ fn render_workspace(
       <div class="exports">
         <p class="caption">Export library (redacts TDM/AUTH_MAN bodies)</p>
         <div class="row">
-          <a href="/export/library.md" class="btn-link">Markdown</a>
-          <a href="/export/library.txt" class="btn-link">Text</a>
-          <a href="/export/library.json" class="btn-link">JSON</a>
+          <a href="export/library.md" class="btn-link">Markdown</a>
+          <a href="export/library.txt" class="btn-link">Text</a>
+          <a href="export/library.json" class="btn-link">JSON</a>
         </div>
       </div>
     </aside>
@@ -1669,6 +1706,7 @@ fn render_workspace(
   </div>
 </body>
 </html>"#,
+        html_escape(base),
         html_escape(domain.display_name()),
         domain.as_str(),
         html_escape(section)
@@ -1723,7 +1761,7 @@ fn render_job_panel(job: Option<&JobSnapshot>, others_running: &[&JobSnapshot]) 
         String::new()
     } else {
         format!(
-            r#"<a class="btn-link" href="/?section={}">View results</a>"#,
+            r#"<a class="btn-link" href="?section={}">View results</a>"#,
             html_escape(&job.section)
         )
     };
@@ -1759,7 +1797,7 @@ fn render_loop_section(
             obj_items.push_str(&format!(
                 r#"<li class="list-row">
                   <span>{escaped}</span>
-                  <form method="post" action="/objectives" class="inline-form">
+                  <form method="post" action="objectives" class="inline-form">
                     <input type="hidden" name="csrf_token" value="{csrf}">
                     <input type="hidden" name="action" value="remove">
                     <input type="hidden" name="text" value="{escaped}">
@@ -1790,7 +1828,7 @@ fn render_loop_section(
       <div class="grid-two">
         <section class="card">
           <h3>Run Bounded Research Stage</h3>
-          <form method="post" action="/loop/discover" class="stack">
+          <form method="post" action="loop/discover" class="stack">
             <input type="hidden" name="csrf_token" value="{csrf}">
             {model_picker}
             <label>Optional focus objective
@@ -1800,12 +1838,12 @@ fn render_loop_section(
           </form>
           <hr>
           <div class="row">
-            <form method="post" action="/loop/validate">
+            <form method="post" action="loop/validate">
               <input type="hidden" name="csrf_token" value="{csrf}">
               <input type="hidden" name="vendor" value="auto">
               <button type="submit" class="btn-secondary">Validate Next Queued Hypothesis</button>
             </form>
-            <form method="post" action="/loop/connect">
+            <form method="post" action="loop/connect">
               <input type="hidden" name="csrf_token" value="{csrf}">
               <input type="hidden" name="vendor" value="auto">
               <button type="submit" class="btn-secondary">Run Connection Review</button>
@@ -1814,7 +1852,7 @@ fn render_loop_section(
         </section>
         <section class="card">
           <h3>Queued Research Objectives ({})</h3>
-          <form method="post" action="/objectives" class="row">
+          <form method="post" action="objectives" class="row">
             <input type="hidden" name="csrf_token" value="{csrf}">
             <input type="hidden" name="action" value="add">
             <input type="text" name="text" placeholder="Add a research question..." required>
@@ -1871,9 +1909,9 @@ fn render_library_section(
               <p>{}</p>
               <div class="row">
                 <a href="{}" rel="noopener noreferrer" target="_blank" class="btn-link">Reader page</a>
-                <a href="/export/paper/{}" class="btn-link">Export Markdown</a>
+                <a href="export/paper/{}" class="btn-link">Export Markdown</a>
                 {proxy_link}
-                <form method="post" action="/papers/retrieve" class="inline-form">
+                <form method="post" action="papers/retrieve" class="inline-form">
                   <input type="hidden" name="csrf_token" value="{csrf}">
                   <input type="hidden" name="paper_id" value="{}">
                   <button type="submit" class="btn-secondary btn-small">Retrieve Full Text</button>
@@ -1903,7 +1941,7 @@ fn render_library_section(
         <p>Every search automatically excludes conference abstracts (<code>NOT PUB_TYPE:"Abstract"</code>) and deduplicates before applying the cap.</p>
       </header>
       <section class="card">
-        <form method="post" action="/literature/search" class="row">
+        <form method="post" action="literature/search" class="row">
           <input type="hidden" name="csrf_token" value="{csrf}">
           <input type="text" name="query" placeholder="Search Europe PMC &amp; configured field/mechanism journals (e.g., cGAS-STING microglia)..." required>
           <button type="submit" class="btn-primary">Search Literature</button>
@@ -1939,7 +1977,7 @@ fn render_queue_section(
               <p><strong>Statement:</strong> {}</p>
               <p class="caption">ID: <code>{}</code> · Origin: {} · Generation: {}</p>
               <ul class="clean-list">{cits}</ul>
-              <form method="post" action="/loop/validate" class="row">
+              <form method="post" action="loop/validate" class="row">
                 <input type="hidden" name="csrf_token" value="{csrf}">
                 <input type="hidden" name="vendor" value="auto">
                 <input type="hidden" name="hypothesis_id" value="{}">
@@ -1966,7 +2004,7 @@ fn render_queue_section(
       </header>
       <section class="card">
         <h3>Queue Manual Hypothesis for Independent Validation</h3>
-        <form method="post" action="/queue/manual" class="stack">
+        <form method="post" action="queue/manual" class="stack">
           <input type="hidden" name="csrf_token" value="{csrf}">
           <label>Working title
             <input type="text" name="title" placeholder="Short descriptive title">
@@ -2009,7 +2047,7 @@ fn render_validations_section(
               <h5>Necessary Claims</h5>
               <ul class="clean-list">{claims_html}</ul>
               <div class="row">
-                <a href="/export/validation/{}" class="btn-link">Export Assessment Markdown</a>
+                <a href="export/validation/{}" class="btn-link">Export Assessment Markdown</a>
               </div>
             </article>"#,
             html_escape(&v.original_statement),
@@ -2075,7 +2113,7 @@ fn render_datasets_section(
         <p>Dataset metadata is strictly separated from supporting article evidence and used only for feasibility and next-test planning.</p>
       </header>
       <section class="card">
-        <form method="post" action="/datasets/discover" class="row">
+        <form method="post" action="datasets/discover" class="row">
           <input type="hidden" name="csrf_token" value="{csrf}">
           <input type="text" name="query" placeholder="Search public cohorts (e.g., glioblastoma EGFR RNA-seq)..." required>
           <button type="submit" class="btn-primary">Discover Public Cohorts</button>
@@ -2117,7 +2155,7 @@ fn render_cycles_section(
         <p>Each cycle surveys configured field &amp; mechanism journals plus Europe PMC, deduplicates before capping, and verifies exact 20+ character quotes.</p>
       </header>
       <section class="card">
-        <form method="post" action="/loop/discover" class="row">
+        <form method="post" action="loop/discover" class="row">
           <input type="hidden" name="csrf_token" value="{csrf}">
           <input type="hidden" name="vendor" value="auto">
           <input type="text" name="objective" placeholder="Optional discovery objective...">
@@ -2208,7 +2246,7 @@ fn render_sources_section(
         <h3>API Keys &amp; Institutional Credentials</h3>
         <p class="caption">Stored in {store_name}. Never written to <code>library.json</code> or shown on this page.</p>
         {store_note}
-        <form method="post" action="/credentials" class="stack">
+        <form method="post" action="credentials" class="stack">
           <input type="hidden" name="csrf_token" value="{csrf}">
           <div class="grid-two">
             <label>Claude API Key ({claude_status})
@@ -2250,7 +2288,7 @@ fn capitalize(text: &str) -> String {
 
 fn render_chatgpt_card(csrf: &str, chatgpt: &ChatGptStatus) -> String {
     let sign_out = format!(
-        r#"<form method="post" action="/chatgpt/sign-out">
+        r#"<form method="post" action="chatgpt/sign-out">
             <input type="hidden" name="csrf_token" value="{csrf}">
             <button type="submit" class="btn-secondary">Sign out</button>
           </form>"#
@@ -2262,7 +2300,7 @@ fn render_chatgpt_card(csrf: &str, chatgpt: &ChatGptStatus) -> String {
     let body = if !chatgpt.signed_in {
         format!(
             r#"<p>Run model stages on your ChatGPT plan instead of an API key. Requests count toward your plan's usage, and you can set limits for this app in ChatGPT settings. Sign-in must be done in a browser on the computer running this app.</p>
-        <form method="post" action="/chatgpt/sign-in">
+        <form method="post" action="chatgpt/sign-in">
           <input type="hidden" name="csrf_token" value="{csrf}">
           <button type="submit" class="btn-primary">Continue with ChatGPT</button>
         </form>"#
@@ -2277,7 +2315,7 @@ fn render_chatgpt_card(csrf: &str, chatgpt: &ChatGptStatus) -> String {
         format!(
             r#"<p>Signed in as <strong>{who}</strong>. ChatGPT plan usage is off, so model stages need an API key.</p>
         <div class="row">
-          <form method="post" action="/chatgpt/sign-in">
+          <form method="post" action="chatgpt/sign-in">
             <input type="hidden" name="csrf_token" value="{csrf}">
             <input type="hidden" name="enable_plan" value="1">
             <button type="submit" class="btn-primary">Use your ChatGPT plan</button>
@@ -2323,7 +2361,7 @@ fn render_connections_section(
         <p>Compares assessed hypotheses to propose testable bridges or reconsider negative/inconclusive ideas when genuinely new cited article bodies appear.</p>
       </header>
       <section class="card">
-        <form method="post" action="/loop/connect" class="row">
+        <form method="post" action="loop/connect" class="row">
           <input type="hidden" name="csrf_token" value="{csrf}">
           <input type="hidden" name="vendor" value="auto">
           <button type="submit" class="btn-primary">Run Connection Review</button>
@@ -2531,7 +2569,7 @@ const WORKSPACE_JS: &str = r##""use strict";
     parts.push(log);
     if (job.status !== "running") {
       const link = el("a", "btn-link", "View results");
-      link.href = "/?section=" + encodeURIComponent(job.section);
+      link.href = "?section=" + encodeURIComponent(job.section);
       parts.push(link);
     }
     panel.replaceChildren(...parts);
@@ -2575,7 +2613,7 @@ const WORKSPACE_JS: &str = r##""use strict";
     }
   }
 
-  const source = new EventSource("/events");
+  const source = new EventSource("events");
   const read = (event) => JSON.parse(event.data);
   source.addEventListener("snapshot", (event) => {
     const before = currentJob();

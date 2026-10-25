@@ -26,8 +26,9 @@ use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
 use axum::Router;
 use chrono::Utc;
+use rand::rngs::OsRng;
+use rand::RngCore;
 use serde::Deserialize;
-use sha2::{Digest, Sha256};
 use std::convert::Infallible;
 use std::sync::Arc;
 use subtle::ConstantTimeEq;
@@ -44,16 +45,30 @@ pub struct AppState {
     pub jobs: Arc<JobRunner>,
     pub library: RwLock<LibrarySnapshot>,
     pub csrf_token: String,
+    /// The value of the session cookie that marks the owner's browser (see `SESSION_COOKIE`).
+    pub session_token: String,
+    /// The token in the start link printed at startup; opening it sets the session cookie.
+    pub bootstrap_token: String,
     pub flash: RwLock<Option<String>>,
+}
+
+/// The cookie that identifies the browser the owner opened the start link in. Every page,
+/// export and action needs it; without it the server answers 401. It is host-scoped by the
+/// browser, so a page on another origin (even one whose DNS name resolves to this loopback
+/// address) never carries it.
+pub const SESSION_COOKIE: &str = "dementia_research_session";
+
+/// 256 random bits from the OS, as hex.
+fn random_token() -> String {
+    let mut bytes = [0u8; 32];
+    OsRng.fill_bytes(&mut bytes);
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 impl AppState {
     pub fn new(store: LibraryStore, keychain: KeychainStore) -> Result<Arc<Self>, ResearchError> {
         let library = store.load()?;
-        let mut hasher = Sha256::new();
-        hasher.update(Uuid::new_v4().as_bytes());
-        hasher.update(Uuid::new_v4().as_bytes());
-        let csrf_token = format!("{:x}", hasher.finalize());
+        let csrf_token = random_token();
         // ChatGPT credentials and preferences live next to library.json, outside it.
         let data_dir = store
             .path()
@@ -68,8 +83,15 @@ impl AppState {
             jobs: Arc::default(),
             library: RwLock::new(library),
             csrf_token,
+            session_token: random_token(),
+            bootstrap_token: random_token(),
             flash: RwLock::new(None),
         }))
+    }
+
+    /// The link that opens the workspace in the owner's browser and starts its session.
+    pub fn start_link(&self, addr: &std::net::SocketAddr) -> String {
+        format!("http://{addr}/?token={}", self.bootstrap_token)
     }
 
     fn provider_access(&self) -> ProviderAccess<'_> {
@@ -116,11 +138,55 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/export/paper/{id}", get(export_paper_md_handler))
         .route("/export/validation/{id}", get(export_validation_md_handler))
         .layer(DefaultBodyLimit::max(256 * 1024))
-        .layer(middleware::from_fn(security_headers_middleware))
+        .layer(middleware::from_fn_with_state(
+            Arc::clone(&state),
+            request_guard_middleware,
+        ))
         .with_state(state)
 }
 
-async fn security_headers_middleware(req: Request<Body>, next: Next) -> Response {
+/// Checks every request before it reaches a handler, then adds the security headers to
+/// every response:
+/// 1. the `Host` must be this server's loopback address (no DNS-rebound names);
+/// 2. apart from the stylesheet, script and OAuth callback, the request must carry the
+///    session cookie, which only the start link sets;
+/// 3. a `POST` must come from this origin.
+async fn request_guard_middleware(
+    State(state): State<Arc<AppState>>,
+    req: Request<Body>,
+    next: Next,
+) -> Response {
+    let mut res = guard_request(&state, req, next).await;
+    apply_security_headers(&mut res);
+    res
+}
+
+async fn guard_request(state: &AppState, req: Request<Body>, next: Next) -> Response {
+    if loopback_authority(req.headers()).is_none() {
+        return (
+            StatusCode::MISDIRECTED_REQUEST,
+            "This server only answers requests addressed to its loopback address.",
+        )
+            .into_response();
+    }
+    let path = req.uri().path();
+    // The stylesheet and script hold nothing private; the OAuth callback is bound to the
+    // pending sign-in by its `state` value and may arrive without the cookie when the
+    // sign-in was started from `localhost` rather than `127.0.0.1`.
+    if path.starts_with("/static/") || path == CALLBACK_PATH {
+        return next.run(req).await;
+    }
+    if req.method() == Method::GET && path == "/" {
+        if let Some(token) = query_value(req.uri().query(), "token") {
+            if verify_csrf(&state.bootstrap_token, &token) {
+                return start_session_response(state);
+            }
+            return unauthorized_response(req.method());
+        }
+    }
+    if !has_session_cookie(req.headers(), &state.session_token) {
+        return unauthorized_response(req.method());
+    }
     if req.method() == Method::POST && !same_origin_allowed(req.headers()) {
         return (
             StatusCode::FORBIDDEN,
@@ -128,8 +194,63 @@ async fn security_headers_middleware(req: Request<Body>, next: Next) -> Response
         )
             .into_response();
     }
+    next.run(req).await
+}
 
-    let mut res = next.run(req).await;
+/// Sets the session cookie and sends the browser to the workspace without the token in
+/// its address bar or history.
+fn start_session_response(state: &AppState) -> Response {
+    let mut res = Redirect::to("/").into_response();
+    let cookie = format!(
+        "{SESSION_COOKIE}={}; Path=/; HttpOnly; SameSite=Lax",
+        state.session_token
+    );
+    if let Ok(value) = HeaderValue::from_str(&cookie) {
+        res.headers_mut().insert(header::SET_COOKIE, value);
+    }
+    res
+}
+
+fn unauthorized_response(method: &Method) -> Response {
+    if method == Method::GET {
+        let page = r#"<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8"><title>Medical Research Agent</title>
+<link rel="stylesheet" href="/static/app.css"></head>
+<body><main class="content">
+<h1>Open the app from its start link</h1>
+<p>This page is only shown to the browser that opened the start link printed in the
+terminal when the app started. Copy that link (it ends in <code>?token=…</code>) into
+this browser, or restart the app to print a new one.</p>
+</main></body></html>"#;
+        (StatusCode::UNAUTHORIZED, Html(page)).into_response()
+    } else {
+        (
+            StatusCode::UNAUTHORIZED,
+            "This request needs the session cookie set by the app's start link.",
+        )
+            .into_response()
+    }
+}
+
+/// The value of `key` in a query string, if present.
+fn query_value(query: Option<&str>, key: &str) -> Option<String> {
+    url::form_urlencoded::parse(query?.as_bytes())
+        .find(|(k, _)| k == key)
+        .map(|(_, v)| v.into_owned())
+}
+
+/// Whether a `Cookie` header carries the session cookie with the expected value.
+pub fn has_session_cookie(headers: &HeaderMap, expected: &str) -> bool {
+    headers
+        .get_all(header::COOKIE)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|line| line.split(';'))
+        .filter_map(|pair| pair.trim().split_once('='))
+        .any(|(name, value)| name.trim() == SESSION_COOKIE && verify_csrf(expected, value.trim()))
+}
+
+fn apply_security_headers(res: &mut Response) {
     let headers = res.headers_mut();
     headers.insert(
         header::CONTENT_SECURITY_POLICY,
@@ -165,9 +286,11 @@ async fn security_headers_middleware(req: Request<Body>, next: Next) -> Response
         header::CACHE_CONTROL,
         HeaderValue::from_static("no-store, max-age=0"),
     );
-    res
 }
 
+/// Whether a `POST` comes from a page this server served: `Sec-Fetch-Site` must be
+/// `same-origin` (or `none`, a direct navigation), and `Origin`, when sent, must be a
+/// plain-HTTP loopback origin (`127.0.0.1`, `localhost` or `[::1]`, any port).
 pub fn same_origin_allowed(headers: &HeaderMap) -> bool {
     if let Some(sec_site) = headers.get("sec-fetch-site").and_then(|v| v.to_str().ok()) {
         if !matches!(sec_site, "same-origin" | "none") {
@@ -175,16 +298,36 @@ pub fn same_origin_allowed(headers: &HeaderMap) -> bool {
         }
     }
     if let Some(origin) = headers.get(header::ORIGIN).and_then(|v| v.to_str().ok()) {
-        let lower = origin.to_ascii_lowercase();
-        if !lower.starts_with("http://127.0.0.1:")
-            && !lower.starts_with("http://localhost:")
-            && lower != "http://127.0.0.1"
-            && lower != "http://localhost"
-        {
+        let allowed = url::Url::parse(origin)
+            .ok()
+            .is_some_and(|u| u.scheme() == "http" && is_loopback_host(&u));
+        if !allowed {
             return false;
         }
     }
     true
+}
+
+fn is_loopback_host(url: &url::Url) -> bool {
+    match url.host() {
+        Some(url::Host::Domain(d)) => d.eq_ignore_ascii_case("localhost"),
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+        None => false,
+    }
+}
+
+/// The port of a request's `Host` header when that header names a loopback address;
+/// `None` for any other authority (including a DNS name an attacker pointed at loopback).
+pub fn loopback_authority(headers: &HeaderMap) -> Option<u16> {
+    let mut hosts = headers.get_all(header::HOST).iter();
+    let host = hosts.next()?.to_str().ok()?;
+    if hosts.next().is_some() {
+        // Two `Host` headers: an ambiguous request is not a loopback one.
+        return None;
+    }
+    let url = url::Url::parse(&format!("http://{host}")).ok()?;
+    is_loopback_host(&url).then(|| url.port().unwrap_or(80))
 }
 
 pub fn verify_csrf(expected: &str, supplied: &str) -> bool {
@@ -222,26 +365,14 @@ fn safe_https_href(url: &url::Url) -> String {
 #[derive(Deserialize, Default)]
 pub struct WorkspaceQuery {
     pub section: Option<String>,
-    pub domain: Option<String>,
 }
 
+/// The workspace. A `GET` never changes anything: the research field is switched only by
+/// the CSRF-protected `POST /domain`.
 async fn index_handler(
     State(state): State<Arc<AppState>>,
     Query(query): Query<WorkspaceQuery>,
 ) -> Html<String> {
-    if let Some(ref dom_str) = query.domain {
-        let requested_domain = if dom_str.eq_ignore_ascii_case("cancer") {
-            ResearchDomain::Cancer
-        } else {
-            ResearchDomain::Dementia
-        };
-        let mut lib = state.library.write().await;
-        if lib.pipeline.settings.domain() != requested_domain {
-            lib.pipeline.select_domain(requested_domain);
-            let _ = state.store.save(&lib);
-        }
-    }
-
     let section = query.section.as_deref().unwrap_or("loop");
     // Built before taking the library lock: listing models can wait on the network.
     let model_picker = if is_loop_section(section) {
@@ -658,7 +789,7 @@ async fn select_model(
 
     let ModelChoice { vendor, model } = choice;
     let m = model.clone();
-    let generate: GenerateFn<'static> = match vendor {
+    let provider_call: GenerateFn<'static> = match vendor {
         ModelVendor::ChatGpt => {
             let app = Arc::clone(state);
             Box::new(move |sys, prompt| {
@@ -705,8 +836,34 @@ async fn select_model(
     Ok(ModelSelection {
         vendor,
         model,
-        generate,
+        generate: budgeted_generate(Arc::clone(state), provider_call),
     })
+}
+
+/// Wraps a provider call so that every attempted model request, including structured-output
+/// repairs, is counted against the daily budget before it is sent. The count is saved with
+/// the library, so it survives a restart.
+pub fn budgeted_generate(app: Arc<AppState>, inner: GenerateFn<'static>) -> GenerateFn<'static> {
+    let inner = Arc::new(inner);
+    Box::new(move |system, prompt| {
+        let app = Arc::clone(&app);
+        let inner = Arc::clone(&inner);
+        Box::pin(async move {
+            {
+                let mut lib = app.library.write().await;
+                lib.pipeline.reserve_model_request(Utc::now())?;
+                let _ = app.store.save(&lib);
+            }
+            // The provider is asked only once the request has been admitted.
+            inner(system, prompt).await
+        })
+    })
+}
+
+/// Why a stage cannot start when the day's model budget is already used up.
+fn budget_message(lib: &LibrarySnapshot, stage: &str) -> Option<String> {
+    (!lib.pipeline.model_budget_available(Utc::now()))
+        .then(|| format!("Cannot start {stage}: {}", ResearchError::BudgetExhausted))
 }
 
 #[derive(Deserialize)]
@@ -714,18 +871,6 @@ struct ChatGptActionForm {
     csrf_token: String,
     section: Option<String>,
     enable_plan: Option<String>,
-}
-
-/// The port this server is reached on, from the `Host` header of a loopback request.
-fn loopback_port(headers: &HeaderMap) -> Option<u16> {
-    let host = headers.get(header::HOST)?.to_str().ok()?;
-    let url = url::Url::parse(&format!("http://{host}")).ok()?;
-    let loopback = match url.host()? {
-        url::Host::Domain(d) => d.eq_ignore_ascii_case("localhost"),
-        url::Host::Ipv4(ip) => ip.is_loopback(),
-        url::Host::Ipv6(ip) => ip.is_loopback(),
-    };
-    loopback.then(|| url.port().unwrap_or(80))
 }
 
 /// "Continue with ChatGPT": sends the browser to OpenAI, which redirects back to
@@ -738,7 +883,7 @@ async fn chatgpt_sign_in_handler(
     if !verify_csrf(&state.csrf_token, &form.csrf_token) {
         return (StatusCode::FORBIDDEN, "Invalid CSRF token").into_response();
     }
-    let Some(port) = loopback_port(&headers) else {
+    let Some(port) = loopback_authority(&headers) else {
         state
             .set_flash("Sign in with ChatGPT from a browser on the computer running this app (http://127.0.0.1).")
             .await;
@@ -915,10 +1060,10 @@ async fn run_discovery_handler(
             generate,
         } = selection;
         let (prev_statements, objective) = {
-            let mut lib = app.library.write().await;
-            lib.pipeline
-                .reserve_model_request(Utc::now())
-                .map_err(|e| format!("Cannot start discovery: {e}"))?;
+            let lib = app.library.read().await;
+            if let Some(message) = budget_message(&lib, "discovery") {
+                return Err(message);
+            }
             let prev: Vec<String> = lib
                 .pipeline
                 .queue
@@ -1013,10 +1158,10 @@ async fn run_validation_handler(
             generate,
         } = selection;
         let supplied_papers = {
-            let mut lib = app.library.write().await;
-            lib.pipeline
-                .reserve_model_request(Utc::now())
-                .map_err(|e| format!("Cannot start validation: {e}"))?;
+            let lib = app.library.read().await;
+            if let Some(message) = budget_message(&lib, "validation") {
+                return Err(message);
+            }
             lib.research_papers(domain)
         };
         progress.report(format!("Using {} · {model}", vendor.display_name()));
@@ -1078,10 +1223,10 @@ async fn run_connection_handler(
             generate,
         } = selection;
         let (items, validations, papers, offset) = {
-            let mut lib = app.library.write().await;
-            lib.pipeline
-                .reserve_model_request(Utc::now())
-                .map_err(|e| format!("Cannot start connection review: {e}"))?;
+            let lib = app.library.read().await;
+            if let Some(message) = budget_message(&lib, "connection review") {
+                return Err(message);
+            }
             (
                 lib.pipeline.queue.clone(),
                 lib.pipeline.validations.clone(),
@@ -1286,14 +1431,9 @@ async fn export_library_json_handler(State(state): State<Arc<AppState>>) -> Resp
     // Swift legacy runs are kept only for round-tripping library.json; they are opaque here,
     // so their papers cannot be checked for restricted bodies and are left out of exports.
     lib.runs.clear();
-    // Redact restricted TDM / author-manuscript bodies from exported JSON bundles as well.
-    for paper in &mut lib.papers {
-        if paper.is_body_redistribution_restricted() {
-            if let Some(ref mut ft) = paper.full_text {
-                ft.passages.clear();
-            }
-        }
-    }
+    // Restricted TDM / author-manuscript bodies are removed from every copy of every paper:
+    // validations, cycles and connection reviews keep their own copies, not only `papers`.
+    lib.redact_restricted_bodies();
     let json = serde_json::to_string_pretty(&lib).unwrap_or_else(|_| "{}".to_string());
     (
         [
@@ -1705,7 +1845,7 @@ fn render_library_section(
     let mut rows = String::new();
     for p in papers {
         let restricted_badge = if p.is_body_redistribution_restricted() {
-            r#"<span class="pill pill-warn">TDM / Author MS (Body not exported)</span>"#
+            r#"<span class="pill pill-warn">Body not exported (no open licence)</span>"#
         } else if p.full_text.is_some() {
             r#"<span class="pill pill-ok">Open-access full text</span>"#
         } else {

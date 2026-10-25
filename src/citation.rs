@@ -31,17 +31,19 @@ pub struct EvidenceDocument {
 /// The one exact-quote rule for every citation path. A quote matches when, after
 /// collapsing whitespace and folding typographic quote marks and dashes, it is a
 /// case-sensitive substring of the passage that:
-/// - has at least `MINIMUM_LENGTH` characters,
+/// - has between `MINIMUM_LENGTH` and `MAXIMUM_LENGTH` characters (a quotation, not a
+///   passage: bodies retrieved under text-mining terms may be quoted briefly, not copied),
 /// - starts and ends on word boundaries (not inside "anti-amyloid", "Alzheimer's" or "0.05"),
 /// - is not directly preceded by a negation it leaves out ("did not", "no", "without", "didn't").
 pub struct QuoteMatcher;
 
 impl QuoteMatcher {
     pub const MINIMUM_LENGTH: usize = 20;
+    pub const MAXIMUM_LENGTH: usize = 400;
 
     pub fn locate(quote: &str, passage: &str) -> Option<QuoteMatch> {
         let needle: Vec<char> = Self::comparable(quote).into_iter().map(|(c, _)| c).collect();
-        if needle.len() < Self::MINIMUM_LENGTH {
+        if needle.len() < Self::MINIMUM_LENGTH || needle.len() > Self::MAXIMUM_LENGTH {
             return None;
         }
         let haystack = Self::comparable(passage);

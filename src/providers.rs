@@ -785,9 +785,7 @@ impl ChatGptPlanProvider {
                 ResearchError::Unavailable(redact_secret(&format!("Network error: {e}"), access_token))
             })?;
         let status = response.status();
-        let bytes = response.bytes().await.map_err(|e| {
-            ResearchError::Unavailable(redact_secret(&format!("Stream error: {e}"), access_token))
-        })?;
+        let bytes = bounded_body(response, access_token).await?;
         let text = String::from_utf8_lossy(&bytes);
         if !status.is_success() {
             return Err(chatgpt_plan_http_error(status.as_u16(), &text));
@@ -808,9 +806,7 @@ impl ChatGptPlanProvider {
                 ResearchError::Unavailable(redact_secret(&format!("Network error: {e}"), access_token))
             })?;
         let status = response.status();
-        let bytes = response.bytes().await.map_err(|e| {
-            ResearchError::Unavailable(redact_secret(&format!("Stream error: {e}"), access_token))
-        })?;
+        let bytes = bounded_body(response, access_token).await?;
         if !status.is_success() {
             return Err(chatgpt_plan_http_error(
                 status.as_u16(),
@@ -1051,6 +1047,29 @@ pub fn is_invalid_key_response(vendor: ModelVendor, status: u16, body: &[u8]) ->
     }
 }
 
+/// Largest provider response read into memory. Model replies and model lists are at most
+/// a few hundred kilobytes; this bounds a misbehaving endpoint.
+const MAX_PROVIDER_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
+
+/// Reads a provider response body up to `MAX_PROVIDER_RESPONSE_BYTES`.
+async fn bounded_body(
+    mut response: reqwest::Response,
+    secret_to_redact: &str,
+) -> Result<Vec<u8>, ResearchError> {
+    let mut data = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(|e| {
+        ResearchError::Unavailable(redact_secret(&format!("Stream error: {e}"), secret_to_redact))
+    })? {
+        if data.len() + chunk.len() > MAX_PROVIDER_RESPONSE_BYTES {
+            return Err(ResearchError::InvalidResponse(
+                "The provider's response exceeded 32 MiB and was discarded.".to_string(),
+            ));
+        }
+        data.extend_from_slice(&chunk);
+    }
+    Ok(data)
+}
+
 async fn post_no_redirect(
     vendor: ModelVendor,
     url: &Url,
@@ -1077,17 +1096,12 @@ async fn post_no_redirect(
         })?;
 
     let status = response.status();
-    let bytes = response
-        .bytes()
-        .await
-        .map_err(|e| {
-            ResearchError::Unavailable(redact_secret(&format!("Stream error: {e}"), secret_to_redact))
-        })?;
+    let bytes = bounded_body(response, secret_to_redact).await?;
 
     if !status.is_success() {
         return Err(provider_error(vendor, status.as_u16(), &bytes, secret_to_redact));
     }
-    Ok(bytes.to_vec())
+    Ok(bytes)
 }
 
 async fn get_no_redirect(
@@ -1114,17 +1128,12 @@ async fn get_no_redirect(
         })?;
 
     let status = response.status();
-    let bytes = response
-        .bytes()
-        .await
-        .map_err(|e| {
-            ResearchError::Unavailable(redact_secret(&format!("Stream error: {e}"), secret_to_redact))
-        })?;
+    let bytes = bounded_body(response, secret_to_redact).await?;
 
     if !status.is_success() {
         return Err(provider_error(vendor, status.as_u16(), &bytes, secret_to_redact));
     }
-    Ok(bytes.to_vec())
+    Ok(bytes)
 }
 
 #[cfg(test)]

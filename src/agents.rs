@@ -28,6 +28,22 @@ pub type RetrieveFn<'a> =
 /// Receives a short description of each step while an agent runs, for live display.
 pub type ProgressFn<'a> = Box<dyn Fn(String) + Send + Sync + 'a>;
 
+/// Article-body text one stage may hold across the papers it retains. Each download is
+/// already capped on its own; this bounds the stage as a whole, and so the records it saves.
+pub const MAX_RETAINED_BODY_BYTES: usize = 64 * 1024 * 1024;
+
+fn body_bytes(paper: &Paper) -> usize {
+    paper
+        .full_text
+        .as_ref()
+        .map_or(0, |ft| ft.passages.iter().map(|p| p.text.len()).sum())
+}
+
+/// Whether the retained bodies leave room for another retrieval.
+fn body_budget_left(retained: &[Paper]) -> bool {
+    retained.iter().map(body_bytes).sum::<usize>() < MAX_RETAINED_BODY_BYTES
+}
+
 pub struct AutonomousDiscoveryAgent<'a> {
     pub generate: GenerateFn<'a>,
     pub search: SearchFn<'a>,
@@ -494,6 +510,13 @@ impl<'a> AutonomousDiscoveryAgent<'a> {
                     if *retrieval_attempts >= 36 {
                         notes.push(format!(
                             "{phase}: full-text retrieval budget reached before {}.",
+                            paper.id
+                        ));
+                        break;
+                    }
+                    if !body_budget_left(all_bodies) {
+                        notes.push(format!(
+                            "{phase}: the article-body memory budget was reached before {}.",
                             paper.id
                         ));
                         break;
@@ -1017,6 +1040,13 @@ impl<'a> HypothesisValidationAgent<'a> {
                     audit.push(failure);
                     continue;
                 }
+                if !body_budget_left(&bodies) {
+                    audit.push(format!(
+                        "{} | not retrieved: the article-body memory budget was reached.",
+                        paper.id
+                    ));
+                    break;
+                }
                 match (self.retrieve)(paper.clone()).await {
                     Ok(ft) => paper.full_text = Some(ft),
                     Err(e) => {
@@ -1415,7 +1445,7 @@ impl<'a> HypothesisValidationAgent<'a> {
             ));
         }
 
-        let citation_failure = "An assessment citation is not an exact quote of at least 20 characters from the supplied body passage, or its source is missing from the corresponding claim's evidence ledger.";
+        let citation_failure = "An assessment citation is not an exact quote of 20 to 400 characters from the supplied body passage, or its source is missing from the corresponding claim's evidence ledger.";
         for claim in &mut assessment.claims {
             if (claim.verdict.is_supported()
                 || claim.verdict == ValidationVerdict::Weakened
@@ -1773,6 +1803,10 @@ impl<'a> HypothesisConnectionAgent<'a> {
                 if !paper.has_retrieval_route(&self.access) || retrievals >= 12 {
                     continue;
                 }
+                if !body_budget_left(&bodies) {
+                    audit.push("Further bodies were not retrieved: the article-body memory budget was reached.".to_string());
+                    break;
+                }
                 retrievals += 1;
                 if let Ok(ft) = (self.retrieve)(paper.clone()).await {
                     paper.full_text = Some(ft);
@@ -2050,7 +2084,7 @@ const DISCOVERY_LANDSCAPE_INSTRUCTIONS: &str = r#"Map the research opportunities
 Provide 1 to 6 directions and select at most 3 for focused investigation."#;
 
 const DISCOVERY_DRAFTING_INSTRUCTIONS: &str = r#"Formulate at most one specific, falsifiable dementia research hypothesis grounded in the supplied article-body excerpts. Return ONLY JSON:
-{"hypotheses":[{"title":"...","statement":"...","type":"...","scope":"...","rationale":"...","necessaryClaims":["..."],"predictions":["...","..."],"falsificationCriteria":["..."],"alternatives":["..."],"nextTest":"...","novelty":"...","support":"...","importance":"...","originality":"...","feasibility":"...","citations":[{"paperID":"knownID","passageID":"knownPassageID","quote":"EXACT contiguous excerpt of at least 20 characters","interpretation":"..."}]}],"reason":"..."}
+{"hypotheses":[{"title":"...","statement":"...","type":"...","scope":"...","rationale":"...","necessaryClaims":["..."],"predictions":["...","..."],"falsificationCriteria":["..."],"alternatives":["..."],"nextTest":"...","novelty":"...","support":"...","importance":"...","originality":"...","feasibility":"...","citations":[{"paperID":"knownID","passageID":"knownPassageID","quote":"EXACT contiguous excerpt of 20 to 400 characters","interpretation":"..."}]}],"reason":"..."}
 Require exact quotes from at least two distinct retrieved article bodies and at least two distinct predictions."#;
 
 const VALIDATION_PLANNING_INSTRUCTIONS: &str = r#"You are an independent dementia research validation agent. Define evaluation criteria BEFORE seeing the proposing agent's rationale or bibliography.
@@ -2059,10 +2093,10 @@ Return ONLY JSON with this schema:
 
 const VALIDATION_ASSESSMENT_INSTRUCTIONS: &str = r#"You are an independent dementia research validation agent. Assess the EXACT ORIGINAL statement against criteria formed before the proposer package was supplied.
 Use only these verdict strings: stronglySupported, provisionallySupported, unresolved, weakened, contradicted, notAssessable. Return ONLY one JSON object:
-{"verdict":"unresolved","confidence":"...","summary":"...","claims":[{"id":"c1","statement":"VERBATIM planned claim","verdict":"unresolved","rationale":"...","citations":[{"paperID":"known ID","passageID":"known passage ID","quote":"EXACT contiguous excerpt of at least 20 characters","interpretation":"..."}]}],"evidence":[{"paperID":"known ID","claimIDs":["c1"],"stance":"...","design":"...","population":"...","sampleSize":"...","exposureComparatorOutcome":"...","followUp":"...","effect":"...","uncertainty":"...","analysisStatus":"...","cohortOverlap":"...","limitations":["..."]}],"canConclude":"...","cannotConclude":"...","wouldChangeAssessment":"...","nextTest":"...","limitations":["..."],"proposedRevision":null}"#;
+{"verdict":"unresolved","confidence":"...","summary":"...","claims":[{"id":"c1","statement":"VERBATIM planned claim","verdict":"unresolved","rationale":"...","citations":[{"paperID":"known ID","passageID":"known passage ID","quote":"EXACT contiguous excerpt of 20 to 400 characters","interpretation":"..."}]}],"evidence":[{"paperID":"known ID","claimIDs":["c1"],"stance":"...","design":"...","population":"...","sampleSize":"...","exposureComparatorOutcome":"...","followUp":"...","effect":"...","uncertainty":"...","analysisStatus":"...","cohortOverlap":"...","limitations":["..."]}],"canConclude":"...","cannotConclude":"...","wouldChangeAssessment":"...","nextTest":"...","limitations":["..."],"proposedRevision":null}"#;
 
 const CONNECTION_PLANNING_INSTRUCTIONS: &str = r#"Compare the supplied assessed dementia hypotheses and identify at most three worthwhile bridges or evidence-backed reconsiderations. Return ONLY JSON:
 {"plans":[{"parentIDs":["uuid1","uuid2"],"reason":"specific mechanism or contradiction worth checking","queries":["query1","query2"]}]}"#;
 
 const CONNECTION_SYNTHESIS_INSTRUCTIONS: &str = r#"Draft separate, testable connection or reconsideration hypotheses grounded in the supplied article-body excerpts. Return ONLY JSON:
-{"connections":[{"draft":{"title":"...","statement":"...","type":"...","scope":"...","rationale":"...","necessaryClaims":["..."],"predictions":["...","..."],"falsificationCriteria":["..."],"alternatives":["..."],"nextTest":"...","novelty":"...","support":"...","importance":"...","originality":"...","feasibility":"...","citations":[{"paperID":"knownID","passageID":"knownPassageID","quote":"EXACT contiguous excerpt of at least 20 characters","interpretation":"..."}]},"parentIDs":["uuid1"],"reason":"...","newEvidencePaperIDs":["knownID"]}]}"#;
+{"connections":[{"draft":{"title":"...","statement":"...","type":"...","scope":"...","rationale":"...","necessaryClaims":["..."],"predictions":["...","..."],"falsificationCriteria":["..."],"alternatives":["..."],"nextTest":"...","novelty":"...","support":"...","importance":"...","originality":"...","feasibility":"...","citations":[{"paperID":"knownID","passageID":"knownPassageID","quote":"EXACT contiguous excerpt of 20 to 400 characters","interpretation":"..."}]},"parentIDs":["uuid1"],"reason":"...","newEvidencePaperIDs":["knownID"]}]}"#;

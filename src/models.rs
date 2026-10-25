@@ -16,6 +16,10 @@ pub enum ResearchError {
     Unavailable(String),
     #[error("Request failed ({0}): {1}")]
     Http(u16, String),
+    /// The provider rejected the API key itself as invalid (see
+    /// `providers::is_invalid_key_response`).
+    #[error("{0}")]
+    InvalidCredential(String),
     #[error("Daily model request allowance reached.")]
     BudgetExhausted,
 }

@@ -496,7 +496,7 @@ impl ClaudeProvider {
             "messages": [{"role": "user", "content": prompt}]
         });
         let headers = Self::headers(key)?;
-        let data = post_no_redirect(&self.endpoint, headers, &body, key).await?;
+        let data = post_no_redirect(ModelVendor::Anthropic, &self.endpoint, headers, &body, key).await?;
 
         #[derive(Deserialize)]
         struct Response {
@@ -573,7 +573,7 @@ impl ClaudeProvider {
             }
             let mut headers = Self::headers(key)?;
             headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
-            let data = get_no_redirect(&url, headers, key).await?;
+            let data = get_no_redirect(ModelVendor::Anthropic, &url, headers, key).await?;
             let page: ModelsPage = serde_json::from_slice(&data).map_err(|e| {
                 ResearchError::InvalidResponse(format!("Invalid Claude models response: {e}"))
             })?;
@@ -642,7 +642,7 @@ impl OpenAiProvider {
         })?;
         headers.insert(AUTHORIZATION, bearer);
 
-        let data = post_no_redirect(&self.endpoint, headers, &body, key).await?;
+        let data = post_no_redirect(ModelVendor::OpenAi, &self.endpoint, headers, &body, key).await?;
 
         #[derive(Deserialize)]
         struct Response {
@@ -697,7 +697,7 @@ impl OpenAiProvider {
         })?;
         headers.insert(AUTHORIZATION, bearer);
 
-        let data = get_no_redirect(&self.models_endpoint, headers, key).await?;
+        let data = get_no_redirect(ModelVendor::OpenAi, &self.models_endpoint, headers, key).await?;
         #[derive(Deserialize)]
         struct ModelsEnvelope {
             data: Vec<ModelRow>,
@@ -1006,7 +1006,53 @@ fn chatgpt_plan_error(status: Option<u16>, error: &ApiError) -> ResearchError {
     }
 }
 
+/// Turns a provider's error response into an error, classified from the full body (the
+/// stored message is a truncated, redacted preview).
+fn provider_error(vendor: ModelVendor, status: u16, body: &[u8], secret: &str) -> ResearchError {
+    let preview: String = String::from_utf8_lossy(body).chars().take(300).collect();
+    let preview = redact_secret(&preview, secret);
+    if is_invalid_key_response(vendor, status, body) {
+        ResearchError::InvalidCredential(format!(
+            "{} rejected the API key as invalid ({status}): {preview}",
+            vendor.display_name()
+        ))
+    } else {
+        ResearchError::Http(status, preview)
+    }
+}
+
+/// Whether an error response says the API key itself is invalid: HTTP 401 carrying
+/// Anthropic's `authentication_error` type or OpenAI's `invalid_api_key` code. Any other
+/// 401, and every credit, quota, rate-limit, permission or outage error, is not.
+pub fn is_invalid_key_response(vendor: ModelVendor, status: u16, body: &[u8]) -> bool {
+    #[derive(Deserialize)]
+    struct Envelope {
+        error: Option<Detail>,
+    }
+    #[derive(Deserialize)]
+    struct Detail {
+        r#type: Option<String>,
+        code: Option<String>,
+    }
+    if status != 401 {
+        return false;
+    }
+    let Ok(Envelope {
+        error: Some(detail),
+    }) = serde_json::from_slice::<Envelope>(body)
+    else {
+        return false;
+    };
+    match vendor {
+        ModelVendor::Anthropic => detail.r#type.as_deref() == Some("authentication_error"),
+        ModelVendor::OpenAi => detail.code.as_deref() == Some("invalid_api_key"),
+        // ChatGPT sign-in tokens are managed by the sign-in flow, never removed here.
+        ModelVendor::ChatGpt => false,
+    }
+}
+
 async fn post_no_redirect(
+    vendor: ModelVendor,
     url: &Url,
     headers: HeaderMap,
     body: &serde_json::Value,
@@ -1039,16 +1085,13 @@ async fn post_no_redirect(
         })?;
 
     if !status.is_success() {
-        let preview: String = String::from_utf8_lossy(&bytes).chars().take(300).collect();
-        return Err(ResearchError::Http(
-            status.as_u16(),
-            redact_secret(&preview, secret_to_redact),
-        ));
+        return Err(provider_error(vendor, status.as_u16(), &bytes, secret_to_redact));
     }
     Ok(bytes.to_vec())
 }
 
 async fn get_no_redirect(
+    vendor: ModelVendor,
     url: &Url,
     headers: HeaderMap,
     secret_to_redact: &str,
@@ -1079,11 +1122,33 @@ async fn get_no_redirect(
         })?;
 
     if !status.is_success() {
-        let preview: String = String::from_utf8_lossy(&bytes).chars().take(300).collect();
-        return Err(ResearchError::Http(
-            status.as_u16(),
-            redact_secret(&preview, secret_to_redact),
-        ));
+        return Err(provider_error(vendor, status.as_u16(), &bytes, secret_to_redact));
     }
     Ok(bytes.to_vec())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn invalid_key_errors_are_classified_from_the_full_body() {
+        // OpenAI's real reply is pretty-printed, so `code` lands past the 300-character
+        // preview; classification must still see it.
+        let openai = format!(
+            "{{\n    \"error\": {{\n        \"message\": \"Incorrect API key provided: sk-proj-****abcd. {}\",\n        \"type\": \"invalid_request_error\",\n        \"param\": null,\n        \"code\": \"invalid_api_key\"\n    }}\n}}\n",
+            "You can find your API key at https://platform.openai.com/account/api-keys. ".repeat(4)
+        );
+        assert!(openai.find("invalid_api_key").expect("code") > 300);
+        assert!(matches!(
+            provider_error(ModelVendor::OpenAi, 401, openai.as_bytes(), "sk-proj-secret"),
+            ResearchError::InvalidCredential(_)
+        ));
+
+        let quota = r#"{"error":{"message":"You exceeded your current quota.","type":"insufficient_quota","code":"insufficient_quota"}}"#;
+        assert!(matches!(
+            provider_error(ModelVendor::OpenAi, 429, quota.as_bytes(), "k"),
+            ResearchError::Http(429, _)
+        ));
+    }
 }

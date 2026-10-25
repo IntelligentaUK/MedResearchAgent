@@ -216,7 +216,7 @@ impl ModelCatalog {
         let result = match tokio::time::timeout(LIST_TIMEOUT, access.list(vendor)).await {
             Ok(Ok(list)) if list.is_empty() => Err("no models are available".to_string()),
             Ok(Ok(list)) => Ok(list),
-            Ok(Err(ResearchError::Http(401, _))) if key_used.is_some() => {
+            Ok(Err(ResearchError::InvalidCredential(_))) if key_used.is_some() => {
                 let key = key_used.unwrap_or_default();
                 return Some(Err(self.forget_rejected_key(access.keychain, vendor, &key).await));
             }

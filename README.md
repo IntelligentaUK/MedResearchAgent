@@ -96,7 +96,7 @@ The first build downloads and compiles all dependencies and takes a few minutes.
   | Linux desktop | Secret Service: GNOME Keyring, KWallet or KeePassXC |
   | No secret store (servers, containers, WSL) | Owner-only `secrets.json` in the data directory, with a warning |
 
-  Credentials are checked before they are saved: Claude API keys must start with `sk-ant-api` (Claude sign-in and Admin tokens are refused), OpenAI keys with `sk-` (admin keys are refused), Elsevier and Wiley tokens must have the expected characters, and the library proxy must be an `https://` address. When Anthropic or OpenAI rejects a saved key as invalid (HTTP 401), while listing models or during a run, the app removes it and says so on the next page.
+  Credentials are checked before they are saved: Claude API keys must start with `sk-ant-api` (Claude sign-in and Admin tokens are refused), OpenAI keys with `sk-` (admin keys are refused), Elsevier and Wiley tokens must have the expected characters, and the library proxy must be an `https://` address. When Anthropic or OpenAI rejects a saved key as invalid, while listing models or during a run, the app removes it and says so on the next page. That means HTTP 401 with Anthropic's `authentication_error` or OpenAI's `invalid_api_key` code; any other 401, and every credit, quota, rate-limit, permission or outage error, leaves the key in place. A key saved after the rejected request is never removed.
 
   The store is chosen when the app starts, so after installing or unlocking a keyring, restart the app to use it. Keys are never moved between stores automatically.
 

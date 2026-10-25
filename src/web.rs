@@ -691,7 +691,7 @@ async fn select_model(
                         _ => ClaudeProvider::default().generate(&k, &m, &sys, &prompt).await,
                     };
                     match result {
-                        Err(ResearchError::Http(401, _)) => Err(ResearchError::Unavailable(
+                        Err(ResearchError::InvalidCredential(_)) => Err(ResearchError::Unavailable(
                             app.models
                                 .forget_rejected_key(&app.keychain, vendor, &k)
                                 .await,

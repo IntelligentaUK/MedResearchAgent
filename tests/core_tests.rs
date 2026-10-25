@@ -609,3 +609,38 @@ async fn credentials_form_saves_valid_keys_and_explains_rejected_ones() {
     assert!(!html.contains("notanapikey"), "the rejected value must not be echoed");
     let _ = std::fs::remove_dir_all(dir);
 }
+
+#[test]
+fn only_a_401_naming_the_key_as_invalid_counts_as_an_invalid_key() {
+    use dementia_research_web::providers::{is_invalid_key_response as invalid, ModelVendor::{Anthropic, ChatGpt, OpenAi}};
+
+    let anthropic_auth = br#"{"type":"error","error":{"type":"authentication_error","message":"invalid x-api-key"},"request_id":"req_1"}"#;
+    let anthropic_missing = br#"{"type":"error","error":{"type":"authentication_error","message":"x-api-key header is required"}}"#;
+    let anthropic_credit = br#"{"type":"error","error":{"type":"invalid_request_error","message":"Your credit balance is too low to access the Anthropic API."}}"#;
+    let anthropic_permission = br#"{"type":"error","error":{"type":"permission_error","message":"Your API key does not have permission to use the specified resource."}}"#;
+    let anthropic_rate = br#"{"type":"error","error":{"type":"rate_limit_error","message":"Number of request tokens has exceeded your per-minute rate limit"}}"#;
+    let anthropic_overloaded = br#"{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}"#;
+    assert!(invalid(Anthropic, 401, anthropic_auth));
+    assert!(invalid(Anthropic, 401, anthropic_missing));
+    assert!(!invalid(Anthropic, 400, anthropic_credit));
+    assert!(!invalid(Anthropic, 403, anthropic_permission));
+    assert!(!invalid(Anthropic, 429, anthropic_rate));
+    assert!(!invalid(Anthropic, 529, anthropic_overloaded));
+    // A 401 that does not name the key as invalid is not enough.
+    assert!(!invalid(Anthropic, 401, anthropic_permission));
+    assert!(!invalid(Anthropic, 401, b"<html>Unauthorized</html>"));
+    assert!(!invalid(Anthropic, 401, b""));
+
+    let openai_invalid = br#"{"error":{"message":"Incorrect API key provided: sk-****abcd.","type":"invalid_request_error","param":null,"code":"invalid_api_key"}}"#;
+    let openai_quota = br#"{"error":{"message":"You exceeded your current quota.","type":"insufficient_quota","param":null,"code":"insufficient_quota"}}"#;
+    let openai_org = br#"{"error":{"message":"You must be a member of an organization to use the API.","type":"invalid_request_error","param":null,"code":"no_organization"}}"#;
+    let openai_ip = br#"{"error":{"message":"You are not allowed to access this resource from this IP address.","type":"invalid_request_error","param":null,"code":null}}"#;
+    assert!(invalid(OpenAi, 401, openai_invalid));
+    assert!(!invalid(OpenAi, 429, openai_quota));
+    assert!(!invalid(OpenAi, 401, openai_org));
+    assert!(!invalid(OpenAi, 401, openai_ip));
+    // Each provider's rule applies only to its own responses.
+    assert!(!invalid(OpenAi, 401, anthropic_auth));
+    assert!(!invalid(Anthropic, 401, openai_invalid));
+    assert!(!invalid(ChatGpt, 401, openai_invalid));
+}

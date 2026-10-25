@@ -5,12 +5,13 @@ use crate::chatgpt::{CallbackParams, ChatGptAuth, ChatGptStatus, CALLBACK_PATH, 
 use crate::catalog::{JournalTier, ResearchSourceCatalog, WIDER_CORPUS_PAGE_SIZE};
 use crate::datasets::CancerDatasetClient;
 use crate::literature::{FreeFullTextClient, FreeLiteratureSearchClient};
+use crate::model_catalog::{ModelCatalog, ModelChoice, ProviderAccess};
 use crate::models::{
     InstitutionalAccess, LibrarySnapshot, Paper, ResearchDomain, ResearchError,
 };
 use crate::providers::{
-    ChatGptPlanProvider, ClaudeProvider, KeychainStore, ModelVendor, OpenAiProvider,
-    SecretBackend,
+    ChatGptPlanProvider, ClaudeProvider, KeychainStore, ModelOption, ModelVendor,
+    OpenAiProvider, SecretBackend,
 };
 use crate::report::ResearchReportBuilder;
 use crate::store::LibraryStore;
@@ -33,6 +34,7 @@ pub struct AppState {
     pub store: LibraryStore,
     pub keychain: KeychainStore,
     pub chatgpt: ChatGptAuth,
+    pub models: ModelCatalog,
     pub library: RwLock<LibrarySnapshot>,
     pub csrf_token: String,
     pub flash: RwLock<Option<String>>,
@@ -45,7 +47,7 @@ impl AppState {
         hasher.update(Uuid::new_v4().as_bytes());
         hasher.update(Uuid::new_v4().as_bytes());
         let csrf_token = format!("{:x}", hasher.finalize());
-        // ChatGPT credentials live next to library.json, outside it.
+        // ChatGPT credentials and preferences live next to library.json, outside it.
         let data_dir = store
             .path()
             .parent()
@@ -54,11 +56,19 @@ impl AppState {
         Ok(Arc::new(Self {
             store,
             keychain,
-            chatgpt: ChatGptAuth::new(data_dir),
+            chatgpt: ChatGptAuth::new(&data_dir),
+            models: ModelCatalog::new(&data_dir),
             library: RwLock::new(library),
             csrf_token,
             flash: RwLock::new(None),
         }))
+    }
+
+    fn provider_access(&self) -> ProviderAccess<'_> {
+        ProviderAccess {
+            keychain: &self.keychain,
+            chatgpt: &self.chatgpt,
+        }
     }
 
     async fn set_flash(&self, msg: impl Into<String>) {
@@ -230,6 +240,12 @@ async fn index_handler(
     let has_openai_key = state.keychain.get("openai_api_key").is_some();
     let chatgpt = state.chatgpt.status().await;
 
+    let model_picker = if is_loop_section(section) {
+        render_model_picker(&state).await
+    } else {
+        String::new()
+    };
+
     Html(render_workspace(
         &lib,
         section,
@@ -240,7 +256,122 @@ async fn index_handler(
         has_openai_key,
         &chatgpt,
         state.keychain.backend(),
+        &model_picker,
     ))
+}
+
+/// The research loop is the default page for any section name not listed here.
+fn is_loop_section(section: &str) -> bool {
+    !matches!(
+        section,
+        "library" | "queue" | "validations" | "datasets" | "cycles" | "sources" | "connections"
+    )
+}
+
+/// The model picker: "Automatic" plus each set-up provider's live model list.
+async fn render_model_picker(state: &Arc<AppState>) -> String {
+    let access = state.provider_access();
+    let (chatgpt_models, claude_models, openai_models) = tokio::join!(
+        state.models.models(&access, ModelVendor::ChatGpt),
+        state.models.models(&access, ModelVendor::Anthropic),
+        state.models.models(&access, ModelVendor::OpenAi),
+    );
+    let preferred = state.models.preferred().await;
+    let current = state.models.resolve_auto(&access).await;
+    let automatic = state.models.resolve_default(&access).await;
+
+    let mut groups = String::new();
+    let mut notes = Vec::new();
+    let mut not_set_up = Vec::new();
+    let mut preferred_listed = false;
+    for (vendor, listed) in [
+        (ModelVendor::ChatGpt, chatgpt_models),
+        (ModelVendor::Anthropic, claude_models),
+        (ModelVendor::OpenAi, openai_models),
+    ] {
+        let options: Vec<ModelOption> = match listed {
+            None => {
+                not_set_up.push(vendor.display_name());
+                continue;
+            }
+            Some(Ok(list)) => list,
+            Some(Err(e)) => {
+                notes.push(format!("Could not list {} models: {e}", vendor.display_name()));
+                match vendor.default_model() {
+                    Some(d) => vec![ModelOption {
+                        id: d.to_string(),
+                        label: format!("{d} (default)"),
+                    }],
+                    None => continue,
+                }
+            }
+        };
+        let mut option_html = String::new();
+        for option in options {
+            let choice = ModelChoice {
+                vendor,
+                model: option.id,
+            };
+            let selected = preferred.as_ref() == Some(&choice);
+            preferred_listed |= selected;
+            option_html.push_str(&format!(
+                r#"<option value="{}"{}>{}</option>"#,
+                html_escape(&choice.encode()),
+                if selected { " selected" } else { "" },
+                html_escape(&option.label)
+            ));
+        }
+        let group = match vendor {
+            ModelVendor::ChatGpt => "ChatGPT plan (Sign in with ChatGPT)",
+            ModelVendor::Anthropic => "Claude (Anthropic API key)",
+            ModelVendor::OpenAi => "OpenAI (API key)",
+        };
+        groups.push_str(&format!(
+            r#"<optgroup label="{}">{option_html}</optgroup>"#,
+            html_escape(group)
+        ));
+    }
+    if !not_set_up.is_empty() {
+        notes.push(format!(
+            "Not set up: {}. Add them in Sources & credentials.",
+            not_set_up.join(", ")
+        ));
+    }
+
+    let automatic_label = match &automatic {
+        Ok(choice) => format!("Automatic ({})", choice.describe()),
+        Err(_) => "Automatic".to_string(),
+    };
+    let current_line = match &current {
+        Ok(choice) => format!(
+            "Validation and connection review use {}.",
+            html_escape(&choice.describe())
+        ),
+        Err(e) => html_escape(&e.to_string()),
+    };
+    let plan_status = if matches!(&current, Ok(c) if c.vendor == ModelVendor::ChatGpt) {
+        format!(
+            r#" · Using ChatGPT plan · <a href="{MANAGE_USAGE_URL}" rel="noopener noreferrer" target="_blank">Manage usage</a>"#
+        )
+    } else {
+        String::new()
+    };
+    let notes_html: String = notes
+        .iter()
+        .map(|n| format!(r#"<p class="caption">{}</p>"#, html_escape(n)))
+        .collect();
+    format!(
+        r#"<label>Model
+              <select name="vendor">
+                <option value="automatic"{}>{}</option>
+                {groups}
+              </select>
+            </label>
+            <p class="caption">{current_line}{plan_status}</p>
+            {notes_html}"#,
+        if preferred_listed { "" } else { " selected" },
+        html_escape(&automatic_label)
+    )
 }
 
 #[derive(Deserialize)]
@@ -478,88 +609,76 @@ struct ModelSelection {
     generate: GenerateFn<'static>,
 }
 
-/// Resolves the provider, model and generator for an agent run. `auto` prefers the ChatGPT
-/// plan when it is enabled, then a Claude key, then an OpenAI key.
+/// Resolves the picker's value into a provider, model and generator for an agent run:
+/// `vendor:model` (remembered for "Automatic"), `automatic` (forget the remembered choice),
+/// `auto` (the remembered choice, else the first set-up provider), or a bare vendor.
 async fn select_model(
     state: &Arc<AppState>,
-    vendor: &str,
+    raw: &str,
     model: Option<&str>,
 ) -> Result<ModelSelection, ResearchError> {
-    let vendor = if vendor.trim().eq_ignore_ascii_case("auto") {
-        if state.chatgpt.status().await.plan_usage {
-            ModelVendor::ChatGpt
-        } else if state.keychain.get("anthropic_api_key").is_some() {
-            ModelVendor::Anthropic
-        } else if state.keychain.get("openai_api_key").is_some() {
-            ModelVendor::OpenAi
-        } else {
-            return Err(ResearchError::Unavailable(
-                "Continue with ChatGPT, or add a Claude or OpenAI API key, in Sources & credentials first.".to_string(),
-            ));
-        }
+    let access = state.provider_access();
+    let raw = raw.trim();
+    let choice = if raw.is_empty() || raw == "auto" {
+        state.models.resolve_auto(&access).await?
+    } else if raw == "automatic" {
+        state.models.remember(None).await?;
+        state.models.resolve_auto(&access).await?
+    } else if let Some(choice) = ModelChoice::decode(raw) {
+        state.models.remember(Some(&choice)).await?;
+        choice
     } else {
-        ModelVendor::parse(vendor)
-    };
-    let requested = model
-        .map(str::trim)
-        .filter(|m| !m.is_empty())
-        .map(str::to_string);
-
-    if vendor == ModelVendor::ChatGpt {
-        let model = match requested {
-            Some(m) => m,
-            None => {
-                let token = state.chatgpt.access_token().await?;
-                ChatGptPlanProvider::default()
-                    .models(&token)
-                    .await?
-                    .into_iter()
-                    .next()
-                    .ok_or_else(|| {
-                        ResearchError::Unavailable(
-                            "Your ChatGPT plan offers no models to this app.".to_string(),
-                        )
-                    })?
-            }
+        let vendor = ModelVendor::parse(raw);
+        let model = match model.map(str::trim).filter(|m| !m.is_empty()) {
+            Some(m) => m.to_string(),
+            None => state.models.default_model(&access, vendor).await?,
         };
-        let app = Arc::clone(state);
-        let m = model.clone();
-        let generate: GenerateFn<'static> = Box::new(move |sys, prompt| {
-            let app = Arc::clone(&app);
-            let m = m.clone();
-            Box::pin(async move {
-                // Fetched per request so long runs pick up refreshed tokens.
-                let token = app.chatgpt.access_token().await?;
-                ChatGptPlanProvider::default()
-                    .generate(&token, &m, &sys, &prompt)
-                    .await
-            })
-        });
-        return Ok(ModelSelection {
-            vendor,
-            model,
-            generate,
-        });
+        ModelChoice { vendor, model }
+    };
+    if !access.ready(choice.vendor).await {
+        return Err(ResearchError::Unavailable(format!(
+            "{} is not set up. Add it in Sources & credentials, or choose another model.",
+            choice.vendor.display_name()
+        )));
     }
 
-    let model = requested
-        .unwrap_or_else(|| vendor.default_model().unwrap_or_default().to_string());
-    let key = match vendor {
-        ModelVendor::OpenAi => state.keychain.get("openai_api_key"),
-        _ => state.keychain.get("anthropic_api_key"),
-    }
-    .unwrap_or_default();
+    let ModelChoice { vendor, model } = choice;
     let m = model.clone();
-    let generate: GenerateFn<'static> = Box::new(move |sys, prompt| {
-        let k = key.clone();
-        let m = m.clone();
-        Box::pin(async move {
-            match vendor {
-                ModelVendor::OpenAi => OpenAiProvider::default().generate(&k, &m, &sys, &prompt).await,
-                _ => ClaudeProvider::default().generate(&k, &m, &sys, &prompt).await,
+    let generate: GenerateFn<'static> = match vendor {
+        ModelVendor::ChatGpt => {
+            let app = Arc::clone(state);
+            Box::new(move |sys, prompt| {
+                let app = Arc::clone(&app);
+                let m = m.clone();
+                Box::pin(async move {
+                    // Fetched per request so long runs pick up refreshed tokens.
+                    let token = app.chatgpt.access_token().await?;
+                    ChatGptPlanProvider::default()
+                        .generate(&token, &m, &sys, &prompt)
+                        .await
+                })
+            })
+        }
+        ModelVendor::Anthropic | ModelVendor::OpenAi => {
+            let key = match vendor {
+                ModelVendor::OpenAi => state.keychain.get("openai_api_key"),
+                _ => state.keychain.get("anthropic_api_key"),
             }
-        })
-    });
+            .unwrap_or_default();
+            Box::new(move |sys, prompt| {
+                let k = key.clone();
+                let m = m.clone();
+                Box::pin(async move {
+                    match vendor {
+                        ModelVendor::OpenAi => {
+                            OpenAiProvider::default().generate(&k, &m, &sys, &prompt).await
+                        }
+                        _ => ClaudeProvider::default().generate(&k, &m, &sys, &prompt).await,
+                    }
+                })
+            })
+        }
+    };
     Ok(ModelSelection {
         vendor,
         model,
@@ -619,7 +738,9 @@ async fn chatgpt_callback_handler(
     State(state): State<Arc<AppState>>,
     Query(params): Query<CallbackParams>,
 ) -> Response {
-    let message = match state.chatgpt.complete_sign_in(params).await {
+    let completed = state.chatgpt.complete_sign_in(params).await;
+    state.models.invalidate(&[ModelVendor::ChatGpt]).await;
+    let message = match completed {
         Ok(status) => {
             let who = status.email.as_deref().unwrap_or("your ChatGPT account");
             if status.plan_usage {
@@ -643,7 +764,9 @@ async fn chatgpt_sign_out_handler(
     if !verify_csrf(&state.csrf_token, &form.csrf_token) {
         return (StatusCode::FORBIDDEN, "Invalid CSRF token").into_response();
     }
-    let message = match state.chatgpt.sign_out().await {
+    let signed_out = state.chatgpt.sign_out().await;
+    state.models.invalidate(&[ModelVendor::ChatGpt]).await;
+    let message = match signed_out {
         Ok(true) => "Signed out of ChatGPT.".to_string(),
         Ok(false) => "Signed out of ChatGPT on this computer, but OpenAI did not confirm the session was revoked. You can disconnect the app in ChatGPT settings.".to_string(),
         Err(e) => format!("ChatGPT sign-out failed: {e}"),
@@ -994,6 +1117,10 @@ async fn save_credentials_handler(
     if state.keychain.save_institutional_access(&updated).is_err() {
         failures.push("institutional access settings");
     }
+    state
+        .models
+        .invalidate(&[ModelVendor::Anthropic, ModelVendor::OpenAi])
+        .await;
     let store = state.keychain.backend().describe();
     let flash = if failures.is_empty() {
         format!("Credentials saved to {store}.")
@@ -1120,6 +1247,7 @@ fn render_workspace(
     has_openai_key: bool,
     chatgpt: &ChatGptStatus,
     secret_store: &SecretBackend,
+    model_picker: &str,
 ) -> String {
     let domain = lib.pipeline.settings.domain();
     let domain_papers = lib.research_papers(domain);
@@ -1194,7 +1322,7 @@ fn render_workspace(
             secret_store,
         ),
         "connections" => render_connections_section(&domain_connections, csrf_token),
-        _ => render_loop_section(lib, domain, csrf_token, chatgpt),
+        _ => render_loop_section(lib, domain, csrf_token, model_picker),
     };
 
     // Shown once, after the first sign-in that enables ChatGPT plan usage.
@@ -1285,16 +1413,9 @@ fn render_loop_section(
     lib: &LibrarySnapshot,
     domain: ResearchDomain,
     csrf_token: &str,
-    chatgpt: &ChatGptStatus,
+    model_picker: &str,
 ) -> String {
     let csrf = html_escape(csrf_token);
-    let plan_status = if chatgpt.plan_usage {
-        format!(
-            r#"<p class="caption">Using ChatGPT plan · <a href="{MANAGE_USAGE_URL}" rel="noopener noreferrer" target="_blank">Manage usage</a></p>"#
-        )
-    } else {
-        String::new()
-    };
     let objectives = lib.pipeline.objectives(domain);
     let mut obj_items = String::new();
     if objectives.is_empty() {
@@ -1341,15 +1462,7 @@ fn render_loop_section(
           <h3>Run Bounded Research Stage</h3>
           <form method="post" action="/loop/discover" class="stack">
             <input type="hidden" name="csrf_token" value="{csrf}">
-            <label>Model provider
-              <select name="vendor">
-                <option value="auto">Automatic (ChatGPT plan, then API keys)</option>
-                <option value="chatgpt">ChatGPT plan (Sign in with ChatGPT)</option>
-                <option value="anthropic">Claude (Anthropic API key)</option>
-                <option value="openai">OpenAI (API key, store: false)</option>
-              </select>
-            </label>
-            {plan_status}
+            {model_picker}
             <label>Optional focus objective
               <input type="text" name="objective" placeholder="{}">
             </label>
@@ -1653,12 +1766,15 @@ fn render_cycles_section(
             r#"<article class="card">
               <h4>Objective: {}</h4>
               <p class="caption">Cycle ID: <code>{}</code> · {} · {} directions mapped · {} hypotheses drafted</p>
+              <p class="caption">Model: <code>{}</code> ({})</p>
             </article>"#,
             html_escape(&c.objective),
             html_escape(&c.id.to_string()),
             html_escape(&c.created_at.to_rfc3339()),
             c.landscape.len(),
-            c.hypotheses.len()
+            c.hypotheses.len(),
+            html_escape(&c.model),
+            html_escape(&c.provider)
         ));
     }
     if cards.is_empty() {
@@ -1858,11 +1974,13 @@ fn render_connections_section(
         cards.push_str(&format!(
             r#"<article class="card">
               <h4>Connection Review <code>{}</code></h4>
-              <p class="caption">Created: {} · Proposals queued: {}</p>
+              <p class="caption">Created: {} · Proposals queued: {} · Model: <code>{}</code> ({})</p>
             </article>"#,
             html_escape(&rev.id.to_string()),
             html_escape(&rev.created_at.to_rfc3339()),
-            rev.proposals.len()
+            rev.proposals.len(),
+            html_escape(&rev.model),
+            html_escape(&rev.provider)
         ));
     }
     if cards.is_empty() {

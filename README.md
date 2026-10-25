@@ -101,8 +101,17 @@ The first build downloads and compiles all dependencies and takes a few minutes.
 
 - **Where to sign in**: OpenAI redirects back to `http://127.0.0.1:<port>/auth/callback` on this server, so start sign-in from a browser on the computer running the app.
 - **Plan usage**: requests count toward the user's ChatGPT plan, subject to OpenAI's eligibility rules (at launch: open-source projects, personal local projects and selected private apps). Users set per-app limits at [chatgpt.com/settings/usage](https://chatgpt.com/settings/usage). If plan usage was declined at sign-in, **Use your ChatGPT plan** asks again.
-- **Choosing a provider**: the research loop's provider defaults to **Automatic** (ChatGPT plan if enabled, then a Claude key, then an OpenAI key). The ChatGPT plan uses the first model the account lists unless one is specified. Plan errors such as **Usage limit reached** stop the run; the app never switches to another billing path on its own.
+- **Plan errors** such as **Usage limit reached** stop the run; the app never switches to another billing path on its own.
 - **Credentials**: tokens are stored in `chatgpt-auth.json` (and the installation's host ID in `chatgpt-host.json`) next to `library.json`, written atomically with `0600` permissions and never placed in the library, HTML or logs. Access tokens are refreshed automatically. **Sign out** revokes the session with OpenAI and deletes the tokens, keeping the registration for the next sign-in.
+
+### Choosing a model
+
+The research loop's **Model** menu lists, live from each provider's API, the models your ChatGPT plan, Claude key and OpenAI key can use (cached for an hour, refreshed when credentials change; OpenAI's list is limited to text-generation models).
+
+- **A model you pick** is remembered in `preferences.json` in the data directory and is also used by **Validate** and **Connection review**. The page says which model those will use.
+- **Automatic** forgets the remembered choice and uses the first provider that is set up (ChatGPT plan, then Claude, then OpenAI) with its default: `claude-opus-5-5` for Claude, otherwise the first model the provider lists.
+- If a provider's list can't be fetched, the page says why; Claude then still offers `claude-opus-5-5`.
+- Each discovery cycle, validation and connection review records the provider and model that produced it, shown on its card and in exports.
 
 ### Sharing `library.json` with the Swift app
 

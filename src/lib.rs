@@ -7,6 +7,7 @@ pub mod citation;
 pub mod datasets;
 pub mod dedup;
 pub mod literature;
+pub mod model_catalog;
 pub mod models;
 pub mod parsers;
 pub mod providers;

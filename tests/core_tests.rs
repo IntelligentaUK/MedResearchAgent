@@ -459,3 +459,50 @@ fn private_file_secret_store_round_trips_with_owner_only_permissions() {
     assert_eq!(reopened.get("openai_api_key").as_deref(), Some("sk-test-other"));
     let _ = std::fs::remove_dir_all(dir);
 }
+
+#[test]
+fn openai_model_list_keeps_only_text_generation_models() {
+    use dementia_research_web::providers::is_openai_text_model;
+
+    for id in ["gpt-5.4", "gpt-4o-mini", "o3", "o4-mini", "chatgpt-4o-latest"] {
+        assert!(is_openai_text_model(id), "{id} should be offered");
+    }
+    for id in [
+        "text-embedding-3-large", "tts-1", "whisper-1", "dall-e-3", "gpt-4o-realtime-preview",
+        "gpt-4o-mini-transcribe", "gpt-image-1", "omni-moderation-latest", "gpt-3.5-turbo-instruct",
+        "babbage-002", "gpt-4o-search-preview",
+    ] {
+        assert!(!is_openai_text_model(id), "{id} should be hidden");
+    }
+}
+
+#[tokio::test]
+async fn loop_page_offers_automatic_model_and_explains_missing_providers() {
+    use axum::body::Body;
+    use axum::http::Request;
+    use dementia_research_web::providers::KeychainStore;
+    use dementia_research_web::store::LibraryStore;
+    use dementia_research_web::web::{build_router, AppState};
+    use http_body_util::BodyExt;
+    use tower::ServiceExt;
+
+    let dir = std::env::temp_dir().join(format!("dra-test-{}", uuid::Uuid::new_v4()));
+    let state = AppState::new(
+        LibraryStore::new(dir.join("library.json")),
+        KeychainStore::in_memory(),
+    )
+    .expect("state");
+    let app = build_router(state);
+    let response = app
+        .oneshot(Request::get("/?section=loop").body(Body::empty()).expect("request"))
+        .await
+        .expect("response");
+    let html = String::from_utf8(
+        response.into_body().collect().await.expect("body").to_bytes().to_vec(),
+    )
+    .expect("utf8");
+    assert!(html.contains(r#"<option value="automatic" selected>Automatic</option>"#));
+    assert!(html.contains("Not set up: ChatGPT plan, Claude (Anthropic), OpenAI."));
+    assert!(!html.contains("<optgroup"));
+    let _ = std::fs::remove_dir_all(dir);
+}

@@ -336,7 +336,7 @@ pub fn redact_secret(text: &str, secret: &str) -> String {
     text.replace(trimmed, "[redacted]")
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ModelVendor {
     Anthropic,
     OpenAi,
@@ -345,6 +345,9 @@ pub enum ModelVendor {
 }
 
 impl ModelVendor {
+    /// Order used by "Automatic" and by the model picker.
+    pub const ALL: [ModelVendor; 3] = [ModelVendor::ChatGpt, ModelVendor::Anthropic, ModelVendor::OpenAi];
+
     pub fn parse(raw: &str) -> Self {
         let raw = raw.trim();
         if raw.eq_ignore_ascii_case("openai") {
@@ -372,14 +375,21 @@ impl ModelVendor {
         }
     }
 
-    /// `None` for the ChatGPT plan, whose models depend on the account and are listed live.
+    /// Used when no model was chosen and none can be listed. Only Claude has one: OpenAI
+    /// and ChatGPT plan models depend on the account, so they are always listed live.
     pub fn default_model(&self) -> Option<&'static str> {
         match self {
-            ModelVendor::Anthropic => Some("claude-sonnet-4-6"),
-            ModelVendor::OpenAi => Some("gpt-5.4"),
-            ModelVendor::ChatGpt => None,
+            ModelVendor::Anthropic => Some("claude-opus-5-5"),
+            ModelVendor::OpenAi | ModelVendor::ChatGpt => None,
         }
     }
+}
+
+/// A model offered by a provider: the API identifier and a name to show.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelOption {
+    pub id: String,
+    pub label: String,
 }
 
 pub struct ClaudeProvider {
@@ -410,29 +420,22 @@ impl ClaudeProvider {
                 "Add a Claude API key in Credentials before running a model stage.".to_string(),
             ));
         }
+        // No sampling parameters: Claude 4.7 and later reject `temperature`/`top_p`/`top_k`.
+        // Current models think before answering, and thinking counts toward `max_tokens`,
+        // so leave room for it as well as the JSON answer.
         let body = serde_json::json!({
             "model": model,
-            "max_tokens": 4096,
-            "temperature": 0.2,
+            "max_tokens": 16000,
             "system": system,
             "messages": [{"role": "user", "content": prompt}]
         });
-        let mut headers = HeaderMap::new();
-        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-        headers.insert(
-            "anthropic-version",
-            HeaderValue::from_static("2023-06-01"),
-        );
-        let key_header = HeaderValue::from_str(key).map_err(|_| {
-            ResearchError::InvalidResponse("Claude API key contains invalid header characters.".to_string())
-        })?;
-        headers.insert("x-api-key", key_header);
-
+        let headers = Self::headers(key)?;
         let data = post_no_redirect(&self.endpoint, headers, &body, key).await?;
 
         #[derive(Deserialize)]
         struct Response {
             content: Vec<Block>,
+            stop_reason: Option<String>,
         }
         #[derive(Deserialize)]
         struct Block {
@@ -442,6 +445,20 @@ impl ClaudeProvider {
         let parsed: Response = serde_json::from_slice(&data).map_err(|e| {
             ResearchError::InvalidResponse(format!("Claude returned an unreadable response: {e}"))
         })?;
+        match parsed.stop_reason.as_deref() {
+            Some("refusal") => {
+                return Err(ResearchError::Unavailable(
+                    "Claude declined this request (refusal). Try another model.".to_string(),
+                ))
+            }
+            Some("max_tokens") => {
+                return Err(ResearchError::InvalidResponse(
+                    "Claude's response was cut off at the output limit.".to_string(),
+                ))
+            }
+            _ => {}
+        }
+        // Thinking blocks are skipped; only the answer text is used.
         let text = parsed
             .content
             .into_iter()
@@ -459,37 +476,62 @@ impl ClaudeProvider {
         Ok(text)
     }
 
-    pub async fn models(&self, api_key: &str) -> Result<Vec<String>, ResearchError> {
+    /// Every model this key can use, newest first, following pagination.
+    pub async fn models(&self, api_key: &str) -> Result<Vec<ModelOption>, ResearchError> {
         let key = api_key.trim();
         if key.is_empty() {
             return Err(ResearchError::Unavailable(
                 "Add a Claude API key first.".to_string(),
             ));
         }
-        let mut headers = HeaderMap::new();
-        headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
-        headers.insert(
-            "anthropic-version",
-            HeaderValue::from_static("2023-06-01"),
-        );
-        let key_header = HeaderValue::from_str(key).map_err(|_| {
-            ResearchError::InvalidResponse("Claude API key contains invalid header characters.".to_string())
-        })?;
-        headers.insert("x-api-key", key_header);
-
-        let data = get_no_redirect(&self.models_endpoint, headers, key).await?;
         #[derive(Deserialize)]
-        struct ModelsEnvelope {
+        struct ModelsPage {
             data: Vec<ModelRow>,
+            #[serde(default)]
+            has_more: bool,
+            last_id: Option<String>,
         }
         #[derive(Deserialize)]
         struct ModelRow {
             id: String,
+            display_name: Option<String>,
         }
-        let env: ModelsEnvelope = serde_json::from_slice(&data).map_err(|e| {
-            ResearchError::InvalidResponse(format!("Invalid Claude models response: {e}"))
+        let mut options = Vec::new();
+        let mut after: Option<String> = None;
+        // Bounded: a handful of pages covers every model by a wide margin.
+        for _ in 0..5 {
+            let mut url = self.models_endpoint.clone();
+            url.query_pairs_mut().append_pair("limit", "1000");
+            if let Some(ref after_id) = after {
+                url.query_pairs_mut().append_pair("after_id", after_id);
+            }
+            let mut headers = Self::headers(key)?;
+            headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
+            let data = get_no_redirect(&url, headers, key).await?;
+            let page: ModelsPage = serde_json::from_slice(&data).map_err(|e| {
+                ResearchError::InvalidResponse(format!("Invalid Claude models response: {e}"))
+            })?;
+            options.extend(page.data.into_iter().map(|m| ModelOption {
+                label: m.display_name.unwrap_or_else(|| m.id.clone()),
+                id: m.id,
+            }));
+            match (page.has_more, page.last_id) {
+                (true, Some(last)) => after = Some(last),
+                _ => break,
+            }
+        }
+        Ok(options)
+    }
+
+    fn headers(key: &str) -> Result<HeaderMap, ResearchError> {
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        headers.insert("anthropic-version", HeaderValue::from_static("2023-06-01"));
+        let key_header = HeaderValue::from_str(key).map_err(|_| {
+            ResearchError::InvalidResponse("Claude API key contains invalid header characters.".to_string())
         })?;
-        Ok(env.data.into_iter().map(|m| m.id).collect())
+        headers.insert("x-api-key", key_header);
+        Ok(headers)
     }
 }
 
@@ -573,7 +615,9 @@ impl OpenAiProvider {
         Ok(text)
     }
 
-    pub async fn models(&self, api_key: &str) -> Result<Vec<String>, ResearchError> {
+    /// Text-generation models this key can use, newest first. The API also lists
+    /// embedding, speech, image and moderation models, which are left out.
+    pub async fn models(&self, api_key: &str) -> Result<Vec<ModelOption>, ResearchError> {
         let key = api_key.trim();
         if key.is_empty() {
             return Err(ResearchError::Unavailable(
@@ -595,12 +639,39 @@ impl OpenAiProvider {
         #[derive(Deserialize)]
         struct ModelRow {
             id: String,
+            #[serde(default)]
+            created: i64,
         }
         let env: ModelsEnvelope = serde_json::from_slice(&data).map_err(|e| {
             ResearchError::InvalidResponse(format!("Invalid OpenAI models response: {e}"))
         })?;
-        Ok(env.data.into_iter().map(|m| m.id).collect())
+        let mut rows: Vec<ModelRow> = env
+            .data
+            .into_iter()
+            .filter(|m| is_openai_text_model(&m.id))
+            .collect();
+        rows.sort_by(|a, b| b.created.cmp(&a.created).then_with(|| a.id.cmp(&b.id)));
+        Ok(rows
+            .into_iter()
+            .map(|m| ModelOption {
+                label: m.id.clone(),
+                id: m.id,
+            })
+            .collect())
     }
+}
+
+/// Whether an OpenAI model ID names a text-generation model usable with the Responses API.
+pub fn is_openai_text_model(id: &str) -> bool {
+    const NOT_TEXT: &[&str] = &[
+        "embedding", "tts", "whisper", "dall-e", "audio", "realtime", "transcribe",
+        "image", "moderation", "search", "instruct", "babbage", "davinci",
+    ];
+    let id = id.to_ascii_lowercase();
+    let family = id.starts_with("gpt-")
+        || id.starts_with("chatgpt-")
+        || (id.starts_with('o') && id[1..].starts_with(|c: char| c.is_ascii_digit()));
+    family && !NOT_TEXT.iter().any(|word| id.contains(word))
 }
 
 /// Model requests billed to the signed-in user's ChatGPT plan. This route requires
@@ -658,8 +729,8 @@ impl ChatGptPlanProvider {
         parse_responses_stream(&text)
     }
 
-    /// Model slugs offered to this account, in the server's order.
-    pub async fn models(&self, access_token: &str) -> Result<Vec<String>, ResearchError> {
+    /// Models offered to this account, in the server's order.
+    pub async fn models(&self, access_token: &str) -> Result<Vec<ModelOption>, ResearchError> {
         let mut headers = Self::headers(access_token)?;
         headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
         let response = Self::client(30, access_token)?
@@ -687,6 +758,7 @@ impl ChatGptPlanProvider {
         #[derive(Deserialize)]
         struct ModelRow {
             slug: String,
+            display_name: Option<String>,
             visibility: Option<String>,
         }
         let env: ModelsEnvelope = serde_json::from_slice(&bytes).map_err(|e| {
@@ -696,7 +768,10 @@ impl ChatGptPlanProvider {
             .models
             .into_iter()
             .filter(|m| m.visibility.as_deref() == Some("list"))
-            .map(|m| m.slug)
+            .map(|m| ModelOption {
+                label: m.display_name.unwrap_or_else(|| m.slug.clone()),
+                id: m.slug,
+            })
             .collect())
     }
 

@@ -1,13 +1,16 @@
 use crate::agents::{
-    AutonomousDiscoveryAgent, HypothesisConnectionAgent, HypothesisValidationAgent,
+    AutonomousDiscoveryAgent, GenerateFn, HypothesisConnectionAgent, HypothesisValidationAgent,
 };
+use crate::chatgpt::{CallbackParams, ChatGptAuth, ChatGptStatus, CALLBACK_PATH, MANAGE_USAGE_URL};
 use crate::catalog::{JournalTier, ResearchSourceCatalog, WIDER_CORPUS_PAGE_SIZE};
 use crate::datasets::CancerDatasetClient;
 use crate::literature::{FreeFullTextClient, FreeLiteratureSearchClient};
 use crate::models::{
     InstitutionalAccess, LibrarySnapshot, Paper, ResearchDomain, ResearchError,
 };
-use crate::providers::{ClaudeProvider, KeychainStore, ModelVendor, OpenAiProvider};
+use crate::providers::{
+    ChatGptPlanProvider, ClaudeProvider, KeychainStore, ModelVendor, OpenAiProvider,
+};
 use crate::report::ResearchReportBuilder;
 use crate::store::LibraryStore;
 use axum::body::Body;
@@ -28,6 +31,7 @@ use uuid::Uuid;
 pub struct AppState {
     pub store: LibraryStore,
     pub keychain: KeychainStore,
+    pub chatgpt: ChatGptAuth,
     pub library: RwLock<LibrarySnapshot>,
     pub csrf_token: String,
     pub flash: RwLock<Option<String>>,
@@ -40,9 +44,16 @@ impl AppState {
         hasher.update(Uuid::new_v4().as_bytes());
         hasher.update(Uuid::new_v4().as_bytes());
         let csrf_token = format!("{:x}", hasher.finalize());
+        // ChatGPT credentials live next to library.json, outside it.
+        let data_dir = store
+            .path()
+            .parent()
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or_default();
         Ok(Arc::new(Self {
             store,
             keychain,
+            chatgpt: ChatGptAuth::new(data_dir),
             library: RwLock::new(library),
             csrf_token,
             flash: RwLock::new(None),
@@ -74,6 +85,10 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/loop/validate", post(run_validation_handler))
         .route("/loop/connect", post(run_connection_handler))
         .route("/credentials", post(save_credentials_handler))
+        .route("/chatgpt/sign-in", post(chatgpt_sign_in_handler))
+        .route(CALLBACK_PATH, get(chatgpt_callback_handler))
+        .route("/chatgpt/sign-out", post(chatgpt_sign_out_handler))
+        .route("/chatgpt/welcome", post(chatgpt_welcome_handler))
         .route("/export/library.md", get(export_library_md_handler))
         .route("/export/library.txt", get(export_library_txt_handler))
         .route("/export/library.json", get(export_library_json_handler))
@@ -98,7 +113,7 @@ async fn security_headers_middleware(req: Request<Body>, next: Next) -> Response
     headers.insert(
         header::CONTENT_SECURITY_POLICY,
         HeaderValue::from_static(
-            "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'",
+            "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self' https://auth.openai.com",
         ),
     );
     headers.insert(
@@ -106,9 +121,12 @@ async fn security_headers_middleware(req: Request<Body>, next: Next) -> Response
         HeaderValue::from_static("nosniff"),
     );
     headers.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
+    // `same-origin` rather than `no-referrer`: under `no-referrer` browsers send `Origin: null`
+    // on form submissions, which `same_origin_allowed` (correctly) rejects. External links
+    // still receive no referrer.
     headers.insert(
         header::REFERRER_POLICY,
-        HeaderValue::from_static("no-referrer"),
+        HeaderValue::from_static("same-origin"),
     );
     headers.insert(
         "Permissions-Policy",
@@ -209,6 +227,7 @@ async fn index_handler(
     let access = state.keychain.institutional_access();
     let has_claude_key = state.keychain.get("anthropic_api_key").is_some();
     let has_openai_key = state.keychain.get("openai_api_key").is_some();
+    let chatgpt = state.chatgpt.status().await;
 
     Html(render_workspace(
         &lib,
@@ -218,6 +237,7 @@ async fn index_handler(
         &access,
         has_claude_key,
         has_openai_key,
+        &chatgpt,
     ))
 }
 
@@ -450,6 +470,203 @@ struct RunAgentForm {
     hypothesis_id: Option<String>,
 }
 
+struct ModelSelection {
+    vendor: ModelVendor,
+    model: String,
+    generate: GenerateFn<'static>,
+}
+
+/// Resolves the provider, model and generator for an agent run. `auto` prefers the ChatGPT
+/// plan when it is enabled, then a Claude key, then an OpenAI key.
+async fn select_model(
+    state: &Arc<AppState>,
+    vendor: &str,
+    model: Option<&str>,
+) -> Result<ModelSelection, ResearchError> {
+    let vendor = if vendor.trim().eq_ignore_ascii_case("auto") {
+        if state.chatgpt.status().await.plan_usage {
+            ModelVendor::ChatGpt
+        } else if state.keychain.get("anthropic_api_key").is_some() {
+            ModelVendor::Anthropic
+        } else if state.keychain.get("openai_api_key").is_some() {
+            ModelVendor::OpenAi
+        } else {
+            return Err(ResearchError::Unavailable(
+                "Continue with ChatGPT, or add a Claude or OpenAI API key, in Sources & credentials first.".to_string(),
+            ));
+        }
+    } else {
+        ModelVendor::parse(vendor)
+    };
+    let requested = model
+        .map(str::trim)
+        .filter(|m| !m.is_empty())
+        .map(str::to_string);
+
+    if vendor == ModelVendor::ChatGpt {
+        let model = match requested {
+            Some(m) => m,
+            None => {
+                let token = state.chatgpt.access_token().await?;
+                ChatGptPlanProvider::default()
+                    .models(&token)
+                    .await?
+                    .into_iter()
+                    .next()
+                    .ok_or_else(|| {
+                        ResearchError::Unavailable(
+                            "Your ChatGPT plan offers no models to this app.".to_string(),
+                        )
+                    })?
+            }
+        };
+        let app = Arc::clone(state);
+        let m = model.clone();
+        let generate: GenerateFn<'static> = Box::new(move |sys, prompt| {
+            let app = Arc::clone(&app);
+            let m = m.clone();
+            Box::pin(async move {
+                // Fetched per request so long runs pick up refreshed tokens.
+                let token = app.chatgpt.access_token().await?;
+                ChatGptPlanProvider::default()
+                    .generate(&token, &m, &sys, &prompt)
+                    .await
+            })
+        });
+        return Ok(ModelSelection {
+            vendor,
+            model,
+            generate,
+        });
+    }
+
+    let model = requested
+        .unwrap_or_else(|| vendor.default_model().unwrap_or_default().to_string());
+    let key = match vendor {
+        ModelVendor::OpenAi => state.keychain.get("openai_api_key"),
+        _ => state.keychain.get("anthropic_api_key"),
+    }
+    .unwrap_or_default();
+    let m = model.clone();
+    let generate: GenerateFn<'static> = Box::new(move |sys, prompt| {
+        let k = key.clone();
+        let m = m.clone();
+        Box::pin(async move {
+            match vendor {
+                ModelVendor::OpenAi => OpenAiProvider::default().generate(&k, &m, &sys, &prompt).await,
+                _ => ClaudeProvider::default().generate(&k, &m, &sys, &prompt).await,
+            }
+        })
+    });
+    Ok(ModelSelection {
+        vendor,
+        model,
+        generate,
+    })
+}
+
+#[derive(Deserialize)]
+struct ChatGptActionForm {
+    csrf_token: String,
+    section: Option<String>,
+    enable_plan: Option<String>,
+}
+
+/// The port this server is reached on, from the `Host` header of a loopback request.
+fn loopback_port(headers: &HeaderMap) -> Option<u16> {
+    let host = headers.get(header::HOST)?.to_str().ok()?;
+    let url = url::Url::parse(&format!("http://{host}")).ok()?;
+    let loopback = match url.host()? {
+        url::Host::Domain(d) => d.eq_ignore_ascii_case("localhost"),
+        url::Host::Ipv4(ip) => ip.is_loopback(),
+        url::Host::Ipv6(ip) => ip.is_loopback(),
+    };
+    loopback.then(|| url.port().unwrap_or(80))
+}
+
+/// "Continue with ChatGPT": sends the browser to OpenAI, which redirects back to
+/// `CALLBACK_PATH` on this server's loopback port.
+async fn chatgpt_sign_in_handler(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Form(form): Form<ChatGptActionForm>,
+) -> Response {
+    if !verify_csrf(&state.csrf_token, &form.csrf_token) {
+        return (StatusCode::FORBIDDEN, "Invalid CSRF token").into_response();
+    }
+    let Some(port) = loopback_port(&headers) else {
+        state
+            .set_flash("Sign in with ChatGPT from a browser on the computer running this app (http://127.0.0.1).")
+            .await;
+        return Redirect::to("/?section=sources").into_response();
+    };
+    match state
+        .chatgpt
+        .begin_sign_in(port, form.enable_plan.is_some())
+        .await
+    {
+        Ok(url) => Redirect::to(url.as_str()).into_response(),
+        Err(e) => {
+            state.set_flash(format!("Could not start ChatGPT sign-in: {e}")).await;
+            Redirect::to("/?section=sources").into_response()
+        }
+    }
+}
+
+async fn chatgpt_callback_handler(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<CallbackParams>,
+) -> Response {
+    let message = match state.chatgpt.complete_sign_in(params).await {
+        Ok(status) => {
+            let who = status.email.as_deref().unwrap_or("your ChatGPT account");
+            if status.plan_usage {
+                format!("Signed in with ChatGPT as {who}. Using ChatGPT plan.")
+            } else {
+                format!(
+                    "Signed in with ChatGPT as {who}, but ChatGPT plan usage was not granted. Choose Use your ChatGPT plan to enable it, or use an API key."
+                )
+            }
+        }
+        Err(e) => format!("ChatGPT sign-in did not complete: {e}"),
+    };
+    state.set_flash(message).await;
+    Redirect::to("/?section=sources").into_response()
+}
+
+async fn chatgpt_sign_out_handler(
+    State(state): State<Arc<AppState>>,
+    Form(form): Form<ChatGptActionForm>,
+) -> Response {
+    if !verify_csrf(&state.csrf_token, &form.csrf_token) {
+        return (StatusCode::FORBIDDEN, "Invalid CSRF token").into_response();
+    }
+    let message = match state.chatgpt.sign_out().await {
+        Ok(true) => "Signed out of ChatGPT.".to_string(),
+        Ok(false) => "Signed out of ChatGPT on this computer, but OpenAI did not confirm the session was revoked. You can disconnect the app in ChatGPT settings.".to_string(),
+        Err(e) => format!("ChatGPT sign-out failed: {e}"),
+    };
+    state.set_flash(message).await;
+    Redirect::to("/?section=sources").into_response()
+}
+
+async fn chatgpt_welcome_handler(
+    State(state): State<Arc<AppState>>,
+    Form(form): Form<ChatGptActionForm>,
+) -> Response {
+    if !verify_csrf(&state.csrf_token, &form.csrf_token) {
+        return (StatusCode::FORBIDDEN, "Invalid CSRF token").into_response();
+    }
+    if let Err(e) = state.chatgpt.dismiss_welcome().await {
+        state.set_flash(format!("Could not save that setting: {e}")).await;
+    }
+    let section = form
+        .section
+        .filter(|s| !s.is_empty() && s.chars().all(|c| c.is_ascii_lowercase()))
+        .unwrap_or_else(|| "loop".to_string());
+    Redirect::to(&format!("/?section={section}")).into_response()
+}
+
 async fn run_discovery_handler(
     State(state): State<Arc<AppState>>,
     Form(form): Form<RunAgentForm>,
@@ -457,19 +674,17 @@ async fn run_discovery_handler(
     if !verify_csrf(&state.csrf_token, &form.csrf_token) {
         return (StatusCode::FORBIDDEN, "Invalid CSRF token").into_response();
     }
-    let vendor = ModelVendor::parse(&form.vendor);
-    let model = form
-        .model
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| vendor.default_model())
-        .to_string();
-    let api_key = match vendor {
-        ModelVendor::Anthropic => state.keychain.get("anthropic_api_key"),
-        ModelVendor::OpenAi => state.keychain.get("openai_api_key"),
-    }
-    .unwrap_or_default();
+    let ModelSelection {
+        vendor,
+        model,
+        generate,
+    } = match select_model(&state, &form.vendor, form.model.as_deref()).await {
+        Ok(selection) => selection,
+        Err(e) => {
+            state.set_flash(format!("Cannot start discovery: {e}")).await;
+            return Redirect::to("/?section=cycles").into_response();
+        }
+    };
 
     let (domain, prev_statements, objective) = {
         let mut lib = state.library.write().await;
@@ -496,24 +711,9 @@ async fn run_discovery_handler(
     let access = state.keychain.institutional_access();
     let access_search = access.clone();
     let access_retrieve = access.clone();
-    let key_clone = api_key.clone();
-    let model_clone = model.clone();
 
     let agent = AutonomousDiscoveryAgent {
-        generate: Box::new(move |sys, prompt| {
-            let k = key_clone.clone();
-            let m = model_clone.clone();
-            Box::pin(async move {
-                match vendor {
-                    ModelVendor::Anthropic => {
-                        ClaudeProvider::default().generate(&k, &m, &sys, &prompt).await
-                    }
-                    ModelVendor::OpenAi => {
-                        OpenAiProvider::default().generate(&k, &m, &sys, &prompt).await
-                    }
-                }
-            })
-        }),
+        generate,
         search: Box::new(move |q| {
             let acc = access_search.clone();
             Box::pin(async move {
@@ -565,19 +765,17 @@ async fn run_validation_handler(
     if !verify_csrf(&state.csrf_token, &form.csrf_token) {
         return (StatusCode::FORBIDDEN, "Invalid CSRF token").into_response();
     }
-    let vendor = ModelVendor::parse(&form.vendor);
-    let model = form
-        .model
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| vendor.default_model())
-        .to_string();
-    let api_key = match vendor {
-        ModelVendor::Anthropic => state.keychain.get("anthropic_api_key"),
-        ModelVendor::OpenAi => state.keychain.get("openai_api_key"),
-    }
-    .unwrap_or_default();
+    let ModelSelection {
+        vendor,
+        model,
+        generate,
+    } = match select_model(&state, &form.vendor, form.model.as_deref()).await {
+        Ok(selection) => selection,
+        Err(e) => {
+            state.set_flash(format!("Cannot start validation: {e}")).await;
+            return Redirect::to("/?section=queue").into_response();
+        }
+    };
 
     let (target_item, supplied_papers, domain) = {
         let mut lib = state.library.write().await;
@@ -611,24 +809,9 @@ async fn run_validation_handler(
     let access = state.keychain.institutional_access();
     let access_search = access.clone();
     let access_retrieve = access.clone();
-    let key_clone = api_key.clone();
-    let model_clone = model.clone();
 
     let agent = HypothesisValidationAgent {
-        generate: Box::new(move |sys, prompt| {
-            let k = key_clone.clone();
-            let m = model_clone.clone();
-            Box::pin(async move {
-                match vendor {
-                    ModelVendor::Anthropic => {
-                        ClaudeProvider::default().generate(&k, &m, &sys, &prompt).await
-                    }
-                    ModelVendor::OpenAi => {
-                        OpenAiProvider::default().generate(&k, &m, &sys, &prompt).await
-                    }
-                }
-            })
-        }),
+        generate,
         search: Box::new(move |q| {
             let acc = access_search.clone();
             Box::pin(async move {
@@ -678,19 +861,17 @@ async fn run_connection_handler(
     if !verify_csrf(&state.csrf_token, &form.csrf_token) {
         return (StatusCode::FORBIDDEN, "Invalid CSRF token").into_response();
     }
-    let vendor = ModelVendor::parse(&form.vendor);
-    let model = form
-        .model
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| vendor.default_model())
-        .to_string();
-    let api_key = match vendor {
-        ModelVendor::Anthropic => state.keychain.get("anthropic_api_key"),
-        ModelVendor::OpenAi => state.keychain.get("openai_api_key"),
-    }
-    .unwrap_or_default();
+    let ModelSelection {
+        vendor,
+        model,
+        generate,
+    } = match select_model(&state, &form.vendor, form.model.as_deref()).await {
+        Ok(selection) => selection,
+        Err(e) => {
+            state.set_flash(format!("Cannot start connection review: {e}")).await;
+            return Redirect::to("/?section=connections").into_response();
+        }
+    };
 
     let (items, validations, papers, offset, domain) = {
         let mut lib = state.library.write().await;
@@ -713,24 +894,9 @@ async fn run_connection_handler(
     let access = state.keychain.institutional_access();
     let access_search = access.clone();
     let access_retrieve = access.clone();
-    let key_clone = api_key.clone();
-    let model_clone = model.clone();
 
     let agent = HypothesisConnectionAgent {
-        generate: Box::new(move |sys, prompt| {
-            let k = key_clone.clone();
-            let m = model_clone.clone();
-            Box::pin(async move {
-                match vendor {
-                    ModelVendor::Anthropic => {
-                        ClaudeProvider::default().generate(&k, &m, &sys, &prompt).await
-                    }
-                    ModelVendor::OpenAi => {
-                        OpenAiProvider::default().generate(&k, &m, &sys, &prompt).await
-                    }
-                }
-            })
-        }),
+        generate,
         search: Box::new(move |q| {
             let acc = access_search.clone();
             Box::pin(async move {
@@ -797,14 +963,15 @@ async fn save_credentials_handler(
     if !verify_csrf(&state.csrf_token, &form.csrf_token) {
         return (StatusCode::FORBIDDEN, "Invalid CSRF token").into_response();
     }
+    let mut failures = Vec::new();
     if let Some(ref k) = form.anthropic_api_key {
-        if !k.trim().is_empty() {
-            let _ = state.keychain.set("anthropic_api_key", k);
+        if !k.trim().is_empty() && state.keychain.set("anthropic_api_key", k).is_err() {
+            failures.push("Claude API key");
         }
     }
     if let Some(ref k) = form.openai_api_key {
-        if !k.trim().is_empty() {
-            let _ = state.keychain.set("openai_api_key", k);
+        if !k.trim().is_empty() && state.keychain.set("openai_api_key", k).is_err() {
+            failures.push("OpenAI API key");
         }
     }
     let current = state.keychain.institutional_access();
@@ -822,10 +989,18 @@ async fn save_credentials_handler(
             .filter(|s| !s.trim().is_empty())
             .or(current.library_proxy_prefix),
     );
-    let _ = state.keychain.save_institutional_access(&updated);
-    state
-        .set_flash("Credentials updated in macOS Keychain.")
-        .await;
+    if state.keychain.save_institutional_access(&updated).is_err() {
+        failures.push("institutional access settings");
+    }
+    let flash = if failures.is_empty() {
+        "Credentials updated in macOS Keychain.".to_string()
+    } else {
+        format!(
+            "macOS Keychain did not save: {}. Check that the login keychain is unlocked.",
+            failures.join(", ")
+        )
+    };
+    state.set_flash(flash).await;
     Redirect::to("/?section=sources").into_response()
 }
 
@@ -939,6 +1114,7 @@ fn render_workspace(
     access: &InstitutionalAccess,
     has_claude_key: bool,
     has_openai_key: bool,
+    chatgpt: &ChatGptStatus,
 ) -> String {
     let domain = lib.pipeline.settings.domain();
     let domain_papers = lib.research_papers(domain);
@@ -1003,9 +1179,35 @@ fn render_workspace(
         "validations" => render_validations_section(&domain_validations),
         "datasets" => render_datasets_section(datasets, csrf_token),
         "cycles" => render_cycles_section(&domain_cycles, csrf_token),
-        "sources" => render_sources_section(domain, csrf_token, access, has_claude_key, has_openai_key),
+        "sources" => render_sources_section(
+            domain,
+            csrf_token,
+            access,
+            has_claude_key,
+            has_openai_key,
+            chatgpt,
+        ),
         "connections" => render_connections_section(&domain_connections, csrf_token),
-        _ => render_loop_section(lib, domain, csrf_token),
+        _ => render_loop_section(lib, domain, csrf_token, chatgpt),
+    };
+
+    // Shown once, after the first sign-in that enables ChatGPT plan usage.
+    let welcome_html = if chatgpt.show_welcome {
+        format!(
+            r#"<div class="alert">
+        <strong>You're using your ChatGPT plan</strong>
+        <p>Model stages in this app now count toward your ChatGPT plan's usage. <a href="{MANAGE_USAGE_URL}" rel="noopener noreferrer" target="_blank">Manage usage</a></p>
+        <form method="post" action="/chatgpt/welcome">
+          <input type="hidden" name="csrf_token" value="{}">
+          <input type="hidden" name="section" value="{}">
+          <button type="submit" class="btn-secondary btn-small">Got it</button>
+        </form>
+      </div>"#,
+            html_escape(csrf_token),
+            html_escape(section)
+        )
+    } else {
+        String::new()
     };
 
     let csrf_escaped = html_escape(csrf_token);
@@ -1061,6 +1263,7 @@ fn render_workspace(
       </div>
     </aside>
     <main class="content">
+      {welcome_html}
       {flash_html}
       {main_content}
     </main>
@@ -1076,8 +1279,16 @@ fn render_loop_section(
     lib: &LibrarySnapshot,
     domain: ResearchDomain,
     csrf_token: &str,
+    chatgpt: &ChatGptStatus,
 ) -> String {
     let csrf = html_escape(csrf_token);
+    let plan_status = if chatgpt.plan_usage {
+        format!(
+            r#"<p class="caption">Using ChatGPT plan · <a href="{MANAGE_USAGE_URL}" rel="noopener noreferrer" target="_blank">Manage usage</a></p>"#
+        )
+    } else {
+        String::new()
+    };
     let objectives = lib.pipeline.objectives(domain);
     let mut obj_items = String::new();
     if objectives.is_empty() {
@@ -1126,10 +1337,13 @@ fn render_loop_section(
             <input type="hidden" name="csrf_token" value="{csrf}">
             <label>Model provider
               <select name="vendor">
-                <option value="anthropic">Claude (Anthropic)</option>
-                <option value="openai">OpenAI (store: false)</option>
+                <option value="auto">Automatic (ChatGPT plan, then API keys)</option>
+                <option value="chatgpt">ChatGPT plan (Sign in with ChatGPT)</option>
+                <option value="anthropic">Claude (Anthropic API key)</option>
+                <option value="openai">OpenAI (API key, store: false)</option>
               </select>
             </label>
+            {plan_status}
             <label>Optional focus objective
               <input type="text" name="objective" placeholder="{}">
             </label>
@@ -1139,12 +1353,12 @@ fn render_loop_section(
           <div class="row">
             <form method="post" action="/loop/validate">
               <input type="hidden" name="csrf_token" value="{csrf}">
-              <input type="hidden" name="vendor" value="anthropic">
+              <input type="hidden" name="vendor" value="auto">
               <button type="submit" class="btn-secondary">Validate Next Queued Hypothesis</button>
             </form>
             <form method="post" action="/loop/connect">
               <input type="hidden" name="csrf_token" value="{csrf}">
-              <input type="hidden" name="vendor" value="anthropic">
+              <input type="hidden" name="vendor" value="auto">
               <button type="submit" class="btn-secondary">Run Connection Review</button>
             </form>
           </div>
@@ -1278,7 +1492,7 @@ fn render_queue_section(
               <ul class="clean-list">{cits}</ul>
               <form method="post" action="/loop/validate" class="row">
                 <input type="hidden" name="csrf_token" value="{csrf}">
-                <input type="hidden" name="vendor" value="anthropic">
+                <input type="hidden" name="vendor" value="auto">
                 <input type="hidden" name="hypothesis_id" value="{}">
                 <button type="submit" class="btn-secondary btn-small">Validate This Hypothesis</button>
               </form>
@@ -1453,7 +1667,7 @@ fn render_cycles_section(
       <section class="card">
         <form method="post" action="/loop/discover" class="row">
           <input type="hidden" name="csrf_token" value="{csrf}">
-          <input type="hidden" name="vendor" value="anthropic">
+          <input type="hidden" name="vendor" value="auto">
           <input type="text" name="objective" placeholder="Optional discovery objective...">
           <button type="submit" class="btn-primary">Start Discovery Cycle</button>
         </form>
@@ -1468,8 +1682,10 @@ fn render_sources_section(
     access: &InstitutionalAccess,
     has_claude_key: bool,
     has_openai_key: bool,
+    chatgpt: &ChatGptStatus,
 ) -> String {
     let csrf = html_escape(csrf_token);
+    let chatgpt_card = render_chatgpt_card(&csrf, chatgpt);
     let journals = ResearchSourceCatalog::all_journals(domain);
     let max_records = ResearchSourceCatalog::maximum_records(domain);
 
@@ -1528,6 +1744,7 @@ fn render_sources_section(
         <h2>Configured Sources &amp; Keychain Credentials ({})</h2>
         <p>Per-search cap: <strong>{max_records}</strong> records ({} field journals × 3 + {} mechanism journals × 2 + wider Europe PMC corpus × {WIDER_CORPUS_PAGE_SIZE}).</p>
       </header>
+      {chatgpt_card}
       <section class="card">
         <h3>macOS Keychain Credentials (Never stored in <code>library.json</code> or echoed to HTML)</h3>
         <form method="post" action="/credentials" class="stack">
@@ -1562,6 +1779,52 @@ fn render_sources_section(
     )
 }
 
+fn render_chatgpt_card(csrf: &str, chatgpt: &ChatGptStatus) -> String {
+    let sign_out = format!(
+        r#"<form method="post" action="/chatgpt/sign-out">
+            <input type="hidden" name="csrf_token" value="{csrf}">
+            <button type="submit" class="btn-secondary">Sign out</button>
+          </form>"#
+    );
+    let manage = format!(
+        r#"<a href="{MANAGE_USAGE_URL}" rel="noopener noreferrer" target="_blank">Manage usage</a>"#
+    );
+    let who = html_escape(chatgpt.email.as_deref().unwrap_or("your ChatGPT account"));
+    let body = if !chatgpt.signed_in {
+        format!(
+            r#"<p>Run model stages on your ChatGPT plan instead of an API key. Requests count toward your plan's usage, and you can set limits for this app in ChatGPT settings. Sign-in must be done in a browser on the computer running this app.</p>
+        <form method="post" action="/chatgpt/sign-in">
+          <input type="hidden" name="csrf_token" value="{csrf}">
+          <button type="submit" class="btn-primary">Continue with ChatGPT</button>
+        </form>"#
+        )
+    } else if chatgpt.plan_usage {
+        format!(
+            r#"<p>Signed in as <strong>{who}</strong>.</p>
+        <p class="caption">Using ChatGPT plan · {manage}</p>
+        {sign_out}"#
+        )
+    } else {
+        format!(
+            r#"<p>Signed in as <strong>{who}</strong>. ChatGPT plan usage is off, so model stages need an API key.</p>
+        <div class="row">
+          <form method="post" action="/chatgpt/sign-in">
+            <input type="hidden" name="csrf_token" value="{csrf}">
+            <input type="hidden" name="enable_plan" value="1">
+            <button type="submit" class="btn-primary">Use your ChatGPT plan</button>
+          </form>
+          {sign_out}
+        </div>"#
+        )
+    };
+    format!(
+        r#"<section class="card">
+        <h3>Use your ChatGPT plan</h3>
+        {body}
+      </section>"#
+    )
+}
+
 fn render_connections_section(
     connections: &[&crate::models::ConnectionReview],
     csrf_token: &str,
@@ -1591,7 +1854,7 @@ fn render_connections_section(
       <section class="card">
         <form method="post" action="/loop/connect" class="row">
           <input type="hidden" name="csrf_token" value="{csrf}">
-          <input type="hidden" name="vendor" value="anthropic">
+          <input type="hidden" name="vendor" value="auto">
           <button type="submit" class="btn-primary">Run Connection Review</button>
         </form>
       </section>

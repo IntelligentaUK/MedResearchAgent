@@ -149,12 +149,17 @@ pub fn redact_secret(text: &str, secret: &str) -> String {
 pub enum ModelVendor {
     Anthropic,
     OpenAi,
+    /// OpenAI models billed to the user's ChatGPT plan via "Sign in with ChatGPT".
+    ChatGpt,
 }
 
 impl ModelVendor {
     pub fn parse(raw: &str) -> Self {
-        if raw.trim().eq_ignore_ascii_case("openai") {
+        let raw = raw.trim();
+        if raw.eq_ignore_ascii_case("openai") {
             ModelVendor::OpenAi
+        } else if raw.eq_ignore_ascii_case("chatgpt") {
+            ModelVendor::ChatGpt
         } else {
             ModelVendor::Anthropic
         }
@@ -164,6 +169,7 @@ impl ModelVendor {
         match self {
             ModelVendor::Anthropic => "anthropic",
             ModelVendor::OpenAi => "openai",
+            ModelVendor::ChatGpt => "chatgpt",
         }
     }
 
@@ -171,13 +177,16 @@ impl ModelVendor {
         match self {
             ModelVendor::Anthropic => "Claude (Anthropic)",
             ModelVendor::OpenAi => "OpenAI",
+            ModelVendor::ChatGpt => "ChatGPT plan",
         }
     }
 
-    pub fn default_model(&self) -> &'static str {
+    /// `None` for the ChatGPT plan, whose models depend on the account and are listed live.
+    pub fn default_model(&self) -> Option<&'static str> {
         match self {
-            ModelVendor::Anthropic => "claude-sonnet-4-6",
-            ModelVendor::OpenAi => "gpt-5.4",
+            ModelVendor::Anthropic => Some("claude-sonnet-4-6"),
+            ModelVendor::OpenAi => Some("gpt-5.4"),
+            ModelVendor::ChatGpt => None,
         }
     }
 }
@@ -400,6 +409,268 @@ impl OpenAiProvider {
             ResearchError::InvalidResponse(format!("Invalid OpenAI models response: {e}"))
         })?;
         Ok(env.data.into_iter().map(|m| m.id).collect())
+    }
+}
+
+/// Model requests billed to the signed-in user's ChatGPT plan. This route requires
+/// `store: false` and `stream: true`, and only a `response.completed` event means success.
+pub struct ChatGptPlanProvider {
+    endpoint: Url,
+    models_endpoint: Url,
+}
+
+impl Default for ChatGptPlanProvider {
+    fn default() -> Self {
+        Self {
+            endpoint: Url::parse("https://api.openai.com/v1/responses").expect("valid URL"),
+            models_endpoint: Url::parse("https://api.openai.com/v1/models").expect("valid URL"),
+        }
+    }
+}
+
+impl ChatGptPlanProvider {
+    pub async fn generate(
+        &self,
+        access_token: &str,
+        model: &str,
+        system: &str,
+        prompt: &str,
+    ) -> Result<String, ResearchError> {
+        let body = serde_json::json!({
+            "model": model,
+            "instructions": system,
+            "input": [{"role": "user", "content": prompt}],
+            "store": false,
+            "stream": true
+        });
+        let mut headers = Self::headers(access_token)?;
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        headers.insert(ACCEPT, HeaderValue::from_static("text/event-stream"));
+        let client = Self::client(300, access_token)?;
+        let response = client
+            .post(self.endpoint.clone())
+            .headers(headers)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| {
+                ResearchError::Unavailable(redact_secret(&format!("Network error: {e}"), access_token))
+            })?;
+        let status = response.status();
+        let bytes = response.bytes().await.map_err(|e| {
+            ResearchError::Unavailable(redact_secret(&format!("Stream error: {e}"), access_token))
+        })?;
+        let text = String::from_utf8_lossy(&bytes);
+        if !status.is_success() {
+            return Err(chatgpt_plan_http_error(status.as_u16(), &text));
+        }
+        parse_responses_stream(&text)
+    }
+
+    /// Model slugs offered to this account, in the server's order.
+    pub async fn models(&self, access_token: &str) -> Result<Vec<String>, ResearchError> {
+        let mut headers = Self::headers(access_token)?;
+        headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
+        let response = Self::client(30, access_token)?
+            .get(self.models_endpoint.clone())
+            .headers(headers)
+            .send()
+            .await
+            .map_err(|e| {
+                ResearchError::Unavailable(redact_secret(&format!("Network error: {e}"), access_token))
+            })?;
+        let status = response.status();
+        let bytes = response.bytes().await.map_err(|e| {
+            ResearchError::Unavailable(redact_secret(&format!("Stream error: {e}"), access_token))
+        })?;
+        if !status.is_success() {
+            return Err(chatgpt_plan_http_error(
+                status.as_u16(),
+                &String::from_utf8_lossy(&bytes),
+            ));
+        }
+        #[derive(Deserialize)]
+        struct ModelsEnvelope {
+            models: Vec<ModelRow>,
+        }
+        #[derive(Deserialize)]
+        struct ModelRow {
+            slug: String,
+            visibility: Option<String>,
+        }
+        let env: ModelsEnvelope = serde_json::from_slice(&bytes).map_err(|e| {
+            ResearchError::InvalidResponse(format!("Invalid ChatGPT plan models response: {e}"))
+        })?;
+        Ok(env
+            .models
+            .into_iter()
+            .filter(|m| m.visibility.as_deref() == Some("list"))
+            .map(|m| m.slug)
+            .collect())
+    }
+
+    fn headers(access_token: &str) -> Result<HeaderMap, ResearchError> {
+        let mut headers = HeaderMap::new();
+        let bearer = HeaderValue::from_str(&format!("Bearer {}", access_token.trim())).map_err(|_| {
+            ResearchError::InvalidResponse("ChatGPT access token contains invalid header characters.".to_string())
+        })?;
+        headers.insert(AUTHORIZATION, bearer);
+        Ok(headers)
+    }
+
+    fn client(timeout_seconds: u64, access_token: &str) -> Result<reqwest::Client, ResearchError> {
+        reqwest::Client::builder()
+            .timeout(Duration::from_secs(timeout_seconds))
+            .redirect(Policy::none())
+            .build()
+            .map_err(|e| {
+                ResearchError::Unavailable(redact_secret(&format!("Transport error: {e}"), access_token))
+            })
+    }
+}
+
+/// Reads a Responses API server-sent event stream and returns the output text. Only a
+/// `response.completed` event counts as success; a stream that ends without one has failed.
+pub fn parse_responses_stream(stream: &str) -> Result<String, ResearchError> {
+    #[derive(Deserialize)]
+    struct Event {
+        r#type: String,
+        delta: Option<String>,
+        response: Option<EventResponse>,
+        code: Option<String>,
+        message: Option<String>,
+        param: Option<String>,
+    }
+    #[derive(Deserialize)]
+    struct EventResponse {
+        error: Option<ApiError>,
+        incomplete_details: Option<IncompleteDetails>,
+    }
+    #[derive(Deserialize)]
+    struct IncompleteDetails {
+        reason: Option<String>,
+    }
+
+    let mut text = String::new();
+    let mut data = String::new();
+    // A blank line ends an event; the trailing "" flushes a final event with no blank line.
+    for line in stream.lines().chain(std::iter::once("")) {
+        if let Some(rest) = line.strip_prefix("data:") {
+            if !data.is_empty() {
+                data.push('\n');
+            }
+            data.push_str(rest.strip_prefix(' ').unwrap_or(rest));
+            continue;
+        }
+        if !line.is_empty() || data.is_empty() {
+            continue;
+        }
+        let payload = std::mem::take(&mut data);
+        if payload == "[DONE]" {
+            continue;
+        }
+        let Ok(event) = serde_json::from_str::<Event>(&payload) else {
+            continue;
+        };
+        match event.r#type.as_str() {
+            "response.output_text.delta" => text.push_str(event.delta.as_deref().unwrap_or("")),
+            "response.completed" => {
+                let text = text.trim().to_string();
+                if text.is_empty() {
+                    return Err(ResearchError::InvalidResponse(
+                        "The ChatGPT plan returned an empty response.".to_string(),
+                    ));
+                }
+                return Ok(text);
+            }
+            "response.failed" => {
+                let error = event.response.and_then(|r| r.error).unwrap_or_default();
+                return Err(chatgpt_plan_error(None, &error));
+            }
+            "response.incomplete" => {
+                let reason = event
+                    .response
+                    .and_then(|r| r.incomplete_details)
+                    .and_then(|d| d.reason)
+                    .unwrap_or_else(|| "unknown".to_string());
+                return Err(ResearchError::InvalidResponse(format!(
+                    "The ChatGPT plan response was incomplete ({reason})."
+                )));
+            }
+            "error" => {
+                let error = ApiError {
+                    code: event.code,
+                    message: event.message,
+                    param: event.param,
+                };
+                return Err(chatgpt_plan_error(None, &error));
+            }
+            _ => {}
+        }
+    }
+    Err(ResearchError::Unavailable(
+        "The ChatGPT plan response ended before it completed.".to_string(),
+    ))
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct ApiError {
+    code: Option<String>,
+    message: Option<String>,
+    param: Option<String>,
+}
+
+/// Maps an HTTP error from the ChatGPT plan route. Bodies are either the standard
+/// `{"error": {...}}` object or `{"detail": "..."}` diagnostic text.
+fn chatgpt_plan_http_error(status: u16, body: &str) -> ResearchError {
+    #[derive(Deserialize)]
+    struct Envelope {
+        error: Option<ApiError>,
+        detail: Option<String>,
+    }
+    let parsed = serde_json::from_str::<Envelope>(body).ok();
+    let error = match parsed {
+        Some(Envelope { error: Some(e), .. }) => e,
+        Some(Envelope { detail, .. }) => ApiError {
+            message: detail,
+            ..ApiError::default()
+        },
+        None => ApiError::default(),
+    };
+    chatgpt_plan_error(Some(status), &error)
+}
+
+/// Plan-billing errors stop the run; the app never silently switches to another billing path.
+fn chatgpt_plan_error(status: Option<u16>, error: &ApiError) -> ResearchError {
+    let manage = crate::chatgpt::MANAGE_USAGE_URL;
+    let code = error.code.as_deref().unwrap_or("");
+    let detail = error.message.as_deref().unwrap_or("").chars().take(300).collect::<String>();
+    let message = match (code, status) {
+        ("subscription_sharing_usage_limit_exceeded", _) => format!(
+            "Usage limit reached for your ChatGPT plan in this app. Manage usage at {manage}."
+        ),
+        ("subscription_sharing_user_not_eligible", _) => {
+            "ChatGPT plan usage is not available for this account, workspace or policy. Choose another model provider.".to_string()
+        }
+        ("subscription_sharing_usage_unavailable", _)
+        | ("subscription_sharing_user_unavailable", _)
+        | (_, Some(503)) => {
+            "ChatGPT plan usage is temporarily unavailable. Try again later.".to_string()
+        }
+        ("subscription_sharing_unsupported_capability", _) => format!(
+            "The ChatGPT plan does not support part of this request ({}).",
+            error.param.as_deref().unwrap_or("unspecified")
+        ),
+        (_, Some(401)) => format!(
+            "The ChatGPT plan rejected this sign-in. Check the account in Sources & credentials. {detail}"
+        ),
+        (_, Some(403)) => format!("The ChatGPT plan refused this request. {detail}"),
+        _ => format!("ChatGPT plan request failed ({code}). {detail}"),
+    };
+    let message = message.trim().to_string();
+    match status {
+        Some(s) => ResearchError::Http(s, message),
+        None => ResearchError::Unavailable(message),
     }
 }
 

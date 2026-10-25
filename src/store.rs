@@ -15,6 +15,35 @@ use uuid::Uuid;
 
 pub const CURRENT_SCHEMA_VERSION: u32 = 4;
 
+/// Atomically replaces `path` with `payload` via a temporary file created with `0600`
+/// (owner-only) permissions on Unix, creating the parent directory if needed.
+pub(crate) fn write_private_file(path: &Path, payload: &[u8]) -> Result<(), ResearchError> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|e| {
+            ResearchError::Unavailable(format!("Could not create data directory: {e}"))
+        })?;
+    }
+    let tmp_path = path.with_extension(format!("json.tmp.{}", Uuid::new_v4()));
+
+    let mut opts = OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        opts.mode(0o600);
+    }
+    let mut file = opts
+        .open(&tmp_path)
+        .map_err(|e| ResearchError::Unavailable(format!("Temp file open failed: {e}")))?;
+    file.write_all(payload)
+        .and_then(|_| file.sync_all())
+        .map_err(|e| ResearchError::Unavailable(format!("Temp file write failed: {e}")))?;
+    drop(file);
+
+    fs::rename(&tmp_path, path)
+        .map_err(|e| ResearchError::Unavailable(format!("Atomic rename failed: {e}")))?;
+    Ok(())
+}
+
 pub struct LibraryStore {
     file_path: PathBuf,
 }
@@ -78,34 +107,9 @@ impl LibraryStore {
     }
 
     pub fn save(&self, snapshot: &LibrarySnapshot) -> Result<(), ResearchError> {
-        if let Some(parent) = self.file_path.parent() {
-            fs::create_dir_all(parent).map_err(|e| {
-                ResearchError::Unavailable(format!("Could not create library directory: {e}"))
-            })?;
-        }
         let payload = serde_json::to_vec_pretty(snapshot)
             .map_err(|e| ResearchError::InvalidResponse(format!("Serialization error: {e}")))?;
-        let tmp_path = self
-            .file_path
-            .with_extension(format!("json.tmp.{}", Uuid::new_v4()));
-
-        let mut opts = OpenOptions::new();
-        opts.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            opts.mode(0o600);
-        }
-        let mut file = opts
-            .open(&tmp_path)
-            .map_err(|e| ResearchError::Unavailable(format!("Temp file open failed: {e}")))?;
-        file.write_all(&payload)
-            .and_then(|_| file.sync_all())
-            .map_err(|e| ResearchError::Unavailable(format!("Temp file write failed: {e}")))?;
-        drop(file);
-
-        fs::rename(&tmp_path, &self.file_path)
-            .map_err(|e| ResearchError::Unavailable(format!("Atomic rename failed: {e}")))?;
-        Ok(())
+        write_private_file(&self.file_path, &payload)
     }
 
     pub fn reverify_all_citations(snapshot: &mut LibrarySnapshot) {

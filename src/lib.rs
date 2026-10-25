@@ -2,6 +2,7 @@
 
 pub mod agents;
 pub mod catalog;
+pub mod chatgpt;
 pub mod citation;
 pub mod datasets;
 pub mod dedup;

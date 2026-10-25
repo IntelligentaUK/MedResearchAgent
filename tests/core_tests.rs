@@ -281,3 +281,119 @@ fn library_snapshot_uses_swift_library_json_format() {
     assert_eq!(legacy.papers[0].abstract_text, "Swift stores this under the abstract key.");
     assert_eq!(legacy.papers[0].retrieved_at.to_rfc3339(), "2026-10-18T12:27:34+00:00");
 }
+
+#[tokio::test]
+async fn pages_send_origin_on_same_origin_form_posts() {
+    use axum::body::Body;
+    use axum::http::{Method, Request, StatusCode};
+    use dementia_research_web::providers::KeychainStore;
+    use dementia_research_web::store::LibraryStore;
+    use dementia_research_web::web::{build_router, AppState};
+    use tower::ServiceExt;
+
+    let dir = std::env::temp_dir().join(format!("dra-test-{}", uuid::Uuid::new_v4()));
+    let state = AppState::new(
+        LibraryStore::new(dir.join("library.json")),
+        KeychainStore::in_memory(),
+    )
+    .expect("state");
+    let app = build_router(state);
+
+    // `no-referrer` makes browsers send `Origin: null` on form posts, which the origin check
+    // rejects; every button in the app then failed with 403.
+    let page = app
+        .clone()
+        .oneshot(Request::get("/").body(Body::empty()).expect("request"))
+        .await
+        .expect("response");
+    assert_eq!(page.headers()[header::REFERRER_POLICY], "same-origin");
+
+    let null_origin = Request::builder()
+        .method(Method::POST)
+        .uri("/domain")
+        .header(header::ORIGIN, "null")
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .body(Body::from("domain=cancer"))
+        .expect("request");
+    let rejected = app.oneshot(null_origin).await.expect("response");
+    assert_eq!(rejected.status(), StatusCode::FORBIDDEN);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn chatgpt_plan_stream_succeeds_only_on_completed_event() {
+    use dementia_research_web::models::ResearchError;
+    use dementia_research_web::providers::parse_responses_stream;
+
+    let ok = "event: response.created\ndata: {\"type\":\"response.created\"}\n\n\
+              data: {\"type\":\"response.output_text.delta\",\"delta\":\"Hello\"}\n\n\
+              data: {\"type\":\"response.output_text.delta\",\"delta\":\", plan\"}\n\n\
+              data: {\"type\":\"response.completed\",\"response\":{}}\n\n";
+    assert_eq!(parse_responses_stream(ok).expect("text"), "Hello, plan");
+
+    // Text without a completion event is a failed request.
+    let cut = "data: {\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}\n\n";
+    assert!(matches!(parse_responses_stream(cut), Err(ResearchError::Unavailable(_))));
+
+    let limit = "data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"subscription_sharing_usage_limit_exceeded\",\"message\":\"limit\"}}}\n\n";
+    let err = parse_responses_stream(limit).expect_err("usage limit").to_string();
+    assert!(err.contains("Usage limit reached") && err.contains("chatgpt.com/settings/usage"));
+
+    let incomplete = "data: {\"type\":\"response.incomplete\",\"response\":{\"incomplete_details\":{\"reason\":\"max_output_tokens\"}}}";
+    let err = parse_responses_stream(incomplete).expect_err("incomplete").to_string();
+    assert!(err.contains("incomplete (max_output_tokens)"));
+}
+
+#[tokio::test]
+async fn continue_with_chatgpt_redirects_to_openai_with_loopback_callback() {
+    use axum::body::Body;
+    use axum::http::{Method, Request, StatusCode};
+    use dementia_research_web::providers::KeychainStore;
+    use dementia_research_web::store::LibraryStore;
+    use dementia_research_web::web::{build_router, AppState};
+    use tower::ServiceExt;
+
+    let dir = std::env::temp_dir().join(format!("dra-test-{}", uuid::Uuid::new_v4()));
+    let state = AppState::new(
+        LibraryStore::new(dir.join("library.json")),
+        KeychainStore::in_memory(),
+    )
+    .expect("state");
+    let csrf = state.csrf_token.clone();
+    let app = build_router(state);
+
+    let sign_in = |host: &'static str, token: String| {
+        Request::builder()
+            .method(Method::POST)
+            .uri("/chatgpt/sign-in")
+            .header(header::HOST, host)
+            .header(header::ORIGIN, format!("http://{host}"))
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .body(Body::from(format!("csrf_token={token}")))
+            .expect("request")
+    };
+
+    let response = app.clone().oneshot(sign_in("localhost:18080", csrf.clone())).await.expect("response");
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    let location = Url::parse(response.headers()[header::LOCATION].to_str().expect("location")).expect("url");
+    assert_eq!(location.host_str(), Some("auth.openai.com"));
+    let redirect_uri = location
+        .query_pairs()
+        .find(|(k, _)| k == "redirect_uri")
+        .map(|(_, v)| v.into_owned());
+    // Always 127.0.0.1 (never localhost), on the port the app was reached on.
+    assert_eq!(redirect_uri.as_deref(), Some("http://127.0.0.1:18080/auth/callback"));
+    assert!(dir.join("chatgpt-host.json").exists());
+
+    let forged = app.clone().oneshot(sign_in("localhost:18080", "wrong".into())).await.expect("response");
+    assert_eq!(forged.status(), StatusCode::FORBIDDEN);
+
+    // A callback that does not match the pending sign-in is refused without saving anything.
+    let callback = Request::get("/auth/callback?code=abc&state=forged&client_id=oaiapp_x")
+        .body(Body::empty())
+        .expect("request");
+    let response = app.oneshot(callback).await.expect("response");
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    assert!(!dir.join("chatgpt-auth.json").exists());
+    let _ = std::fs::remove_dir_all(dir);
+}

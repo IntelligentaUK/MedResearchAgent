@@ -34,7 +34,8 @@ To minimize attack surface while handling untrusted scientific literature (JATS 
 - [`src/parsers.rs`](src/parsers.rs) — `ArticleTextParser` (`jats` with `<!ENTITY` XXE rejection, `bioc` JSON parser, `ElsevierArticleParser` with DOI verification).
 - [`src/literature.rs`](src/literature.rs) — `PublicLiteratureUrlPolicy`, `EuropePmcClient`, `OpenAccessResolver`, `InstitutionalFullTextClient`, `FreeFullTextClient`, and `FreeLiteratureSearchClient`.
 - [`src/datasets.rs`](src/datasets.rs) — `CancerDatasetUrlPolicy` and `CancerDatasetClient` (public NCI GDC & cBioPortal catalogs).
-- [`src/providers.rs`](src/providers.rs) — `KeychainStore`, `ClaudeProvider`, and `OpenAiProvider` (`store: false`, `Policy::none()`, secret redaction).
+- [`src/providers.rs`](src/providers.rs) — `KeychainStore`, `ClaudeProvider`, `OpenAiProvider` (`store: false`, `Policy::none()`, secret redaction), and `ChatGptPlanProvider` (streaming Responses API billed to a ChatGPT plan).
+- [`src/chatgpt.rs`](src/chatgpt.rs) — "Sign in with ChatGPT" (OAuth 2.0 + PKCE + OpenID Connect, dynamic client registration, ID-token verification against OpenAI's JWKS, token refresh and revocation).
 - [`src/agents.rs`](src/agents.rs) — `AutonomousDiscoveryAgent`, `HypothesisValidationAgent` (4 mandatory search lenses), and `HypothesisConnectionAgent`.
 - [`src/report.rs`](src/report.rs) — `ResearchReportBuilder` (Markdown and plain-text export with TDM/`AUTH_MAN:Y` body redaction).
 - [`src/store.rs`](src/store.rs) — Atomic `0600` `LibraryStore` persistence and citation re-verification on load.
@@ -74,8 +75,17 @@ The first build downloads and compiles all dependencies and takes a few minutes.
 ### Configuration
 
 - **Address**: set `DEMENTIA_RESEARCH_ADDR` to change the listening address, e.g. `DEMENTIA_RESEARCH_ADDR=127.0.0.1:3000 cargo run --release`. Only loopback addresses (`127.0.0.1`, `::1`) are accepted; anything else exits with an error.
-- **API keys**: enter Claude/OpenAI keys and institutional TDM tokens in the app. They are stored in the macOS Keychain, not in environment variables or files.
+- **Model access**: either **Continue with ChatGPT** (see below) or enter Claude/OpenAI API keys in **Sources & credentials**. API keys and institutional TDM tokens are stored in the macOS Keychain, not in environment variables or files; on Windows and Linux they are not yet persisted, so use Sign in with ChatGPT there.
 - **Library location**: research state is saved to `~/Library/Application Support/DementiaResearch/library.json` on macOS (`~/.local/share/dementia-research/library.json` elsewhere).
+
+### Sign in with ChatGPT
+
+**Sources & credentials → Continue with ChatGPT** signs in with a ChatGPT account using OpenAI's [open-source/local "Sign in with ChatGPT" flow](https://developers.openai.com/siwc/token-sharing-open-source), so model stages run on the user's ChatGPT plan instead of an API key. No client secret or API key is needed: OpenAI registers this installation during the first sign-in.
+
+- **Where to sign in**: OpenAI redirects back to `http://127.0.0.1:<port>/auth/callback` on this server, so start sign-in from a browser on the computer running the app.
+- **Plan usage**: requests count toward the user's ChatGPT plan, subject to OpenAI's eligibility rules (at launch: open-source projects, personal local projects and selected private apps). Users set per-app limits at [chatgpt.com/settings/usage](https://chatgpt.com/settings/usage). If plan usage was declined at sign-in, **Use your ChatGPT plan** asks again.
+- **Choosing a provider**: the research loop's provider defaults to **Automatic** (ChatGPT plan if enabled, then a Claude key, then an OpenAI key). The ChatGPT plan uses the first model the account lists unless one is specified. Plan errors such as **Usage limit reached** stop the run; the app never switches to another billing path on its own.
+- **Credentials**: tokens are stored in `chatgpt-auth.json` (and the installation's host ID in `chatgpt-host.json`) next to `library.json`, written atomically with `0600` permissions and never placed in the library, HTML or logs. Access tokens are refreshed automatically. **Sign out** revokes the session with OpenAI and deletes the tokens, keeping the registration for the next sign-in.
 
 ### Sharing `library.json` with the Swift app
 

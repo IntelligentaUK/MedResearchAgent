@@ -14,8 +14,10 @@ To minimize attack surface while handling untrusted scientific literature (JATS 
 3. **Server-Rendered Views, Minimal Same-Origin Script + Contextual HTML Auto-Escaping**:
    - All 8 workspace views are server-rendered HTML with strict contextual escaping ([`html_escape`](src/web.rs)) and a locked-down Content Security Policy (`default-src 'self'; script-src 'self'; frame-ancestors 'none'`; no inline scripts).
    - One small same-origin script (`/static/app.js`) keeps the activity panel live. It builds every element with `textContent` and holds no application state; without it, the pages still work and show progress on reload.
-4. **Constant-Time CSRF & Same-Origin Enforcement**:
-   - Every state-changing `POST` endpoint validates a 256-bit session CSRF token in constant time using `subtle::ConstantTimeEq` ([`verify_csrf`](src/web.rs)) and enforces `Sec-Fetch-Site` (`same-origin` / `none`) + loopback `Origin` verification ([`same_origin_allowed`](src/web.rs)).
+4. **Owner Session, Host Check, Constant-Time CSRF & Same-Origin Enforcement**:
+   - Loopback is reachable by every process and user on the computer, so reachability is not identity. At startup the app prints a **start link** (`http://127.0.0.1:8080/?token=…`); opening it sets an `HttpOnly`, `SameSite=Lax` session cookie, and every page, export, event stream and action is refused with `401` without that cookie ([`request_guard_middleware`](src/web.rs)). Only the stylesheet, the script and the OAuth callback (bound to its sign-in by `state`) are served without it. The cookie is scoped to the host the browser used, so a DNS name an attacker points at `127.0.0.1` never carries it.
+   - Every request's `Host` must be a loopback authority (`127.0.0.1`, `localhost` or `[::1]`); anything else, or two `Host` headers, gets `421` before any handler runs, which closes DNS rebinding.
+   - Every state-changing `POST` endpoint validates a 256-bit session CSRF token in constant time using `subtle::ConstantTimeEq` ([`verify_csrf`](src/web.rs)) and enforces `Sec-Fetch-Site` (`same-origin` / `none`) + a parsed loopback `Origin` ([`same_origin_allowed`](src/web.rs)). A `GET` never changes state: the research field is switched only by `POST /domain`.
 5. **Loopback-Only Binding & OS Secret Storage**:
    - [`src/main.rs`](src/main.rs) binds exclusively to `127.0.0.1:8080` by default and refuses non-loopback interfaces.
    - API keys and institutional TDM tokens are stored in the operating system's secret store ([`KeychainStore`](src/providers.rs)): the macOS Keychain (through the Apple-signed `/usr/bin/security`, with secrets passed on stdin rather than the command line), Windows Credential Manager, or the Linux Secret Service. They are redacted from all transport errors and never written to `library.json` or echoed in HTML.
@@ -23,7 +25,11 @@ To minimize attack surface while handling untrusted scientific literature (JATS 
 6. **Domain & Evidence Integrity**:
    - **Abstract Exclusion**: Every Europe PMC query includes `NOT PUB_TYPE:"Abstract"`, and `Paper::is_conference_abstract` drops any conference abstract before full-text retrieval attempts in discovery, validation, and connection agents.
    - **Deduplication Before Cap**: [`PaperDeduplicator`](src/dedup.rs) bridges shared DOIs, PMIDs, PMCIDs, and source IDs before applying per-search caps (`50` for Dementia across 8 field + 7 mechanism journals + wider Europe PMC; `36` for Cancer across 8 field journals + wider Europe PMC).
-   - **Author-Manuscript & TDM Fallback + Export Redaction**: [`FreeFullTextClient`](src/literature.rs) falls back to configured institutional TDM when an `AUTH_MAN:Y` record is absent from PMC BioC, and [`ResearchReportBuilder::paper`](src/report.rs) omits restricted `AUTH_MAN:Y` and TDM article bodies from exported reports while preserving short verified quotes (`>= 20` characters, word-bounded, negation-checked, SHA-256 checksummed).
+   - **Author-Manuscript & TDM Fallback + Export Redaction**: [`FreeFullTextClient`](src/literature.rs) falls back to configured institutional TDM when an `AUTH_MAN:Y` record is absent from PMC BioC. Exports redistribute an article body only when its licence is known to allow it (a Creative Commons or public-domain wording or URL, [`license_permits_redistribution`](src/models.rs)); author manuscripts without an open licence, institutional TDM copies, licences that forbid redistribution and unknown or missing licences all keep the body local, and the more restrictive of the record's and the document's statements wins. The JSON export strips such bodies from every copy of every paper (the library and each validation, cycle and connection review, [`LibrarySnapshot::redact_restricted_bodies`](src/models.rs)), and reports keep only short verified quotes (20 to 400 characters, word-bounded, negation-checked, SHA-256 checksummed), with at most 1,000 quoted characters per restricted source in each hypothesis or claim.
+   - **Full text is bound to the paper it was requested for** on every route: JATS XML must carry a matching DOI, PMID, PMCID or title and no conflicting identifier, PMC BioC documents must carry the requested PMCID, and Elsevier TDM responses must carry the requested DOI ([`ArticleTextParser`](src/parsers.rs)). A response that cannot be tied to the paper is not stored as its evidence.
+   - **Publisher credentials go only to the publisher**: institutional TDM downloads follow redirects one hop at a time; every hop must be HTTPS on the default port to a DNS name, and the Elsevier and Wiley credential headers are sent only to the host the request started on ([`tdm_hop_headers`](src/literature.rs)).
+   - **Bounded parsing and memory**: remote XML is limited to 20 MiB, 250,000 nodes and 256 levels of nesting (checked by a markup scan before the parser, whose recursion a deeper document would overflow); each stage retains at most 64 MiB of article-body text across its papers.
+   - **Daily model budget counts every request**: each call to a provider, including structured-output repairs, reserves one request from the daily budget before it is sent, and the count is saved with the library.
 
 ## Project Structure
 
@@ -73,7 +79,7 @@ cargo test
 cargo run --release
 ```
 
-The first build downloads and compiles all dependencies and takes a few minutes. When the server prints `listening on http://127.0.0.1:8080`, open that address in your browser.
+The first build downloads and compiles all dependencies and takes a few minutes. When the server starts it prints a **start link** of the form `http://127.0.0.1:8080/?token=…`; open that link (not the bare address) in your browser. It sets the session cookie the app requires, and the token is good for as long as that server process runs. A bare `http://127.0.0.1:8080/` from a browser without the cookie shows a page asking for the start link.
 
 ### Configuration
 

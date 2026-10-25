@@ -242,7 +242,12 @@ impl EuropePmcClient {
         if !paper.is_open_access {
             let (data, _) =
                 download_public(&bioc_url, "application/json", false, 20 * 1024 * 1024).await?;
-            return ArticleTextParser::bioc(&data, bioc_url, Some(AUTHOR_MANUSCRIPT_LICENSE));
+            return ArticleTextParser::bioc(
+                &data,
+                bioc_url,
+                Some(AUTHOR_MANUSCRIPT_LICENSE),
+                Some(&identifier),
+            );
         }
 
         let jats_url = self
@@ -252,7 +257,12 @@ impl EuropePmcClient {
 
         match download_public(&jats_url, "application/xml", false, 20 * 1024 * 1024).await {
             Ok((data, _)) => {
-                match ArticleTextParser::jats(&data, jats_url, paper.license.as_deref()) {
+                // The body is attached only when the XML identifies itself as this paper.
+                let parsed = ArticleTextParser::jats(&data, jats_url, paper.license.as_deref())
+                    .and_then(|article| {
+                        ArticleTextParser::validate_xml_identity(&data, paper).map(|()| article)
+                    });
+                match parsed {
                     Ok(article) => return Ok(article),
                     Err(first_err) => {
                         let (bioc_data, _) = download_public(
@@ -271,6 +281,7 @@ impl EuropePmcClient {
                             &bioc_data,
                             bioc_url,
                             paper.license.as_deref(),
+                            Some(&identifier),
                         );
                     }
                 }
@@ -284,7 +295,12 @@ impl EuropePmcClient {
                                 "Structured full text was unavailable. Europe PMC: {first_err} BioC: {second_err}"
                             ))
                         })?;
-                ArticleTextParser::bioc(&bioc_data, bioc_url, paper.license.as_deref())
+                ArticleTextParser::bioc(
+                    &bioc_data,
+                    bioc_url,
+                    paper.license.as_deref(),
+                    Some(&identifier),
+                )
             }
         }
     }
@@ -825,80 +841,89 @@ pub async fn download_public(
     Ok((data, final_url))
 }
 
+/// Redirect hops a credentialed text-mining download may follow.
+pub const TDM_MAX_REDIRECTS: usize = 5;
+
+/// Whether a text-mining redirect may be followed: HTTPS on the default port, to a DNS name
+/// (never an IP literal, so never a private or link-local address) and with no credentials
+/// in the URL.
+pub fn tdm_destination_allowed(url: &Url) -> bool {
+    url.scheme() == "https"
+        && matches!(url.port(), None | Some(443))
+        && url.username().is_empty()
+        && url.password().is_none()
+        && matches!(url.host(), Some(url::Host::Domain(d)) if !d.is_empty() && !d.ends_with('.'))
+}
+
+/// The headers for one hop of a text-mining download. Publisher credentials are sent only
+/// to the publisher host the request started on; every other host gets a credential-free
+/// request, whichever hop it is.
+pub fn tdm_hop_headers(origin_host: &str, hop: &Url, headers: &HeaderMap) -> HeaderMap {
+    let mut out = headers.clone();
+    let same_host = hop
+        .host_str()
+        .is_some_and(|h| h.eq_ignore_ascii_case(origin_host));
+    if !same_host {
+        out.remove("X-ELS-APIKey");
+        out.remove("X-ELS-Insttoken");
+        out.remove("Wiley-TDM-Client-Token");
+        out.remove(AUTHORIZATION);
+        out.remove(COOKIE);
+    }
+    out
+}
+
 async fn download_tdm(
     url: &Url,
     headers: HeaderMap,
     publisher: TdmPublisher,
 ) -> Result<(Vec<u8>, Url), ResearchError> {
     let origin_host = url.host_str().unwrap_or("").to_ascii_lowercase();
+    // Every redirect is followed by hand so each hop's destination and headers are checked.
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(45))
-        .redirect(Policy::custom(move |attempt| {
-            if attempt.url().scheme() != "https" {
-                return attempt.stop();
-            }
-            if attempt.previous().len() >= 5 {
-                return attempt.error("Too many redirects");
-            }
-            attempt.follow()
-        }))
-        .build()
-        .map_err(|e| ResearchError::Unavailable(format!("TDM transport error: {e}")))?;
-
-    // Check first hop manually if redirected off-host so TDM headers are never sent to a CDN host
-    let no_redirect_client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(30))
         .redirect(Policy::none())
         .build()
         .map_err(|e| ResearchError::Unavailable(format!("TDM transport error: {e}")))?;
 
-    let initial = no_redirect_client
-        .get(url.clone())
-        .headers(headers.clone())
-        .header(
-            USER_AGENT,
-            "DementiaResearch/0.4 (institutional text and data mining; rustls)",
-        )
-        .send()
-        .await
-        .map_err(|e| ResearchError::Unavailable(format!("TDM request error: {e}")))?;
-
-    let mut response = if initial.status().is_redirection() {
-        let Some(loc) = initial
-            .headers()
-            .get(reqwest::header::LOCATION)
-            .and_then(|v| v.to_str().ok())
-            .and_then(|s| url.join(s).ok())
-        else {
-            return Err(ResearchError::InvalidResponse(
-                "Invalid TDM redirect location.".to_string(),
-            ));
-        };
-        if loc.scheme() != "https" {
-            return Err(ResearchError::InvalidResponse(
-                "Insecure TDM redirect blocked.".to_string(),
-            ));
-        }
-        let mut next_headers = headers;
-        if loc.host_str().map(|h| h.to_ascii_lowercase()).as_deref() != Some(origin_host.as_str()) {
-            next_headers.remove("X-ELS-APIKey");
-            next_headers.remove("X-ELS-Insttoken");
-            next_headers.remove("Wiley-TDM-Client-Token");
-            next_headers.remove(AUTHORIZATION);
-            next_headers.remove(COOKIE);
-        }
-        client
-            .get(loc)
-            .headers(next_headers)
+    let mut current = url.clone();
+    let mut hops = 0usize;
+    let mut response = loop {
+        let response = client
+            .get(current.clone())
+            .headers(tdm_hop_headers(&origin_host, &current, &headers))
             .header(
                 USER_AGENT,
                 "DementiaResearch/0.4 (institutional text and data mining; rustls)",
             )
             .send()
             .await
-            .map_err(|e| ResearchError::Unavailable(format!("TDM redirect error: {e}")))?
-    } else {
-        initial
+            .map_err(|e| ResearchError::Unavailable(format!("TDM request error: {e}")))?;
+        if !response.status().is_redirection() {
+            break response;
+        }
+        hops += 1;
+        if hops > TDM_MAX_REDIRECTS {
+            return Err(ResearchError::InvalidResponse(
+                "The TDM download was redirected too many times.".to_string(),
+            ));
+        }
+        let Some(next) = response
+            .headers()
+            .get(reqwest::header::LOCATION)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| current.join(s).ok())
+        else {
+            return Err(ResearchError::InvalidResponse(
+                "Invalid TDM redirect location.".to_string(),
+            ));
+        };
+        if !tdm_destination_allowed(&next) {
+            return Err(ResearchError::InvalidResponse(
+                "A TDM redirect to an unsupported destination was blocked.".to_string(),
+            ));
+        }
+        current = next;
     };
 
     let status = response.status();

@@ -10,9 +10,74 @@ use dementia_research_web::models::{
 };
 use dementia_research_web::parsers::{ArticleTextParser, AUTHOR_MANUSCRIPT_LICENSE};
 use dementia_research_web::report::ResearchReportBuilder;
-use dementia_research_web::web::{html_escape, same_origin_allowed, verify_csrf};
-use axum::http::{header, HeaderMap, HeaderValue};
+use dementia_research_web::web::{
+    html_escape, same_origin_allowed, verify_csrf, AppState, SESSION_COOKIE,
+};
+use axum::http::{header, HeaderMap, HeaderValue, Method, Request};
+use std::sync::Arc;
 use url::Url;
+
+/// A fresh app state on an empty temporary data directory.
+fn fresh_state() -> (Arc<AppState>, std::path::PathBuf) {
+    use dementia_research_web::providers::KeychainStore;
+    use dementia_research_web::store::LibraryStore;
+    let dir = std::env::temp_dir().join(format!("dra-test-{}", uuid::Uuid::new_v4()));
+    let state = AppState::new(
+        LibraryStore::new(dir.join("library.json")),
+        KeychainStore::in_memory(),
+    )
+    .expect("state");
+    (state, dir)
+}
+
+/// A request as the owner's browser sends it: addressed to the loopback host and carrying
+/// the session cookie the start link set.
+fn owner_request(state: &AppState, method: Method, uri: &str) -> axum::http::request::Builder {
+    owner_request_at(state, method, uri, "127.0.0.1:8080")
+}
+
+fn owner_request_at(
+    state: &AppState,
+    method: Method,
+    uri: &str,
+    host: &str,
+) -> axum::http::request::Builder {
+    Request::builder()
+        .method(method)
+        .uri(uri)
+        .header(header::HOST, host)
+        .header(
+            header::COOKIE,
+            format!("{SESSION_COOKIE}={}", state.session_token),
+        )
+}
+
+/// A paper whose stored body may not be redistributed, holding `sentinel` as its only passage.
+fn restricted_paper(id: &str, sentinel: &str) -> Paper {
+    let source_url = Url::parse("https://www.ncbi.nlm.nih.gov/research/bionlp/RESTful/pmcoa.cgi/BioC_json/PMC6500498/unicode").unwrap();
+    Paper {
+        id: id.to_string(),
+        title: "L1 drives IFN in senescent cells".to_string(),
+        pmcid: Some("PMC6500498".to_string()),
+        is_open_access: false,
+        is_author_manuscript: true,
+        full_text: Some(ArticleText {
+            passages: vec![Passage {
+                id: "body-1".to_string(),
+                section: "Results".to_string(),
+                text: sentinel.to_string(),
+            }],
+            format: "PMC BioC JSON".to_string(),
+            source_url,
+            retrieved_at: Utc::now(),
+            checksum: "abc123".to_string(),
+            license: Some(AUTHOR_MANUSCRIPT_LICENSE.to_string()),
+            version: None,
+            license_url: None,
+        }),
+        ..Paper::default()
+    }
+}
 
 #[test]
 fn catalog_tiers_and_caps_match_specification() {
@@ -108,35 +173,16 @@ fn parsers_reject_xxe_entities_and_bioc_html_error_pages() {
 
     let bioc_missing = br#"<html><body>No result can be found.</body></html>"#;
     let bioc_url = Url::parse("https://www.ncbi.nlm.nih.gov/research/bionlp/RESTful/pmcoa.cgi/BioC_json/PMC1/unicode").unwrap();
-    let bioc_res = ArticleTextParser::bioc(bioc_missing, bioc_url, Some(AUTHOR_MANUSCRIPT_LICENSE));
+    let bioc_res = ArticleTextParser::bioc(bioc_missing, bioc_url, Some(AUTHOR_MANUSCRIPT_LICENSE), Some("PMC1"));
     assert!(bioc_res.is_err());
 }
 
 #[test]
 fn report_builder_omits_restricted_author_manuscript_and_tdm_passages() {
-    let source_url = Url::parse("https://www.ncbi.nlm.nih.gov/research/bionlp/RESTful/pmcoa.cgi/BioC_json/PMC6500498/unicode").unwrap();
-    let paper = Paper {
-        id: "MED:30728521".to_string(),
-        title: "L1 drives IFN in senescent cells".to_string(),
-        pmcid: Some("PMC6500498".to_string()),
-        is_open_access: false,
-        is_author_manuscript: true,
-        full_text: Some(ArticleText {
-            passages: vec![Passage {
-                id: "body-1".to_string(),
-                section: "Results".to_string(),
-                text: "Sensitive author manuscript body text that must not be redistributed in full.".to_string(),
-            }],
-            format: "PMC BioC JSON".to_string(),
-            source_url,
-            retrieved_at: Utc::now(),
-            checksum: "abc123".to_string(),
-            license: Some(AUTHOR_MANUSCRIPT_LICENSE.to_string()),
-            version: None,
-            license_url: None,
-        }),
-        ..Paper::default()
-    };
+    let paper = restricted_paper(
+        "MED:30728521",
+        "Sensitive author manuscript body text that must not be redistributed in full.",
+    );
 
     assert!(paper.is_body_redistribution_restricted());
     let report = ResearchReportBuilder::paper(&paper);
@@ -285,32 +331,24 @@ fn library_snapshot_uses_swift_library_json_format() {
 #[tokio::test]
 async fn pages_send_origin_on_same_origin_form_posts() {
     use axum::body::Body;
-    use axum::http::{Method, Request, StatusCode};
-    use dementia_research_web::providers::KeychainStore;
-    use dementia_research_web::store::LibraryStore;
-    use dementia_research_web::web::{build_router, AppState};
+    use axum::http::StatusCode;
+    use dementia_research_web::web::build_router;
     use tower::ServiceExt;
 
-    let dir = std::env::temp_dir().join(format!("dra-test-{}", uuid::Uuid::new_v4()));
-    let state = AppState::new(
-        LibraryStore::new(dir.join("library.json")),
-        KeychainStore::in_memory(),
-    )
-    .expect("state");
-    let app = build_router(state);
+    let (state, dir) = fresh_state();
+    let app = build_router(state.clone());
 
     // `no-referrer` makes browsers send `Origin: null` on form posts, which the origin check
     // rejects; every button in the app then failed with 403.
     let page = app
         .clone()
-        .oneshot(Request::get("/").body(Body::empty()).expect("request"))
+        .oneshot(owner_request(&state, Method::GET, "/").body(Body::empty()).expect("request"))
         .await
         .expect("response");
+    assert_eq!(page.status(), StatusCode::OK);
     assert_eq!(page.headers()[header::REFERRER_POLICY], "same-origin");
 
-    let null_origin = Request::builder()
-        .method(Method::POST)
-        .uri("/domain")
+    let null_origin = owner_request(&state, Method::POST, "/domain")
         .header(header::ORIGIN, "null")
         .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
         .body(Body::from("domain=cancer"))
@@ -347,26 +385,21 @@ fn chatgpt_plan_stream_succeeds_only_on_completed_event() {
 #[tokio::test]
 async fn continue_with_chatgpt_redirects_to_openai_with_loopback_callback() {
     use axum::body::Body;
-    use axum::http::{Method, Request, StatusCode};
-    use dementia_research_web::providers::KeychainStore;
-    use dementia_research_web::store::LibraryStore;
-    use dementia_research_web::web::{build_router, AppState};
+    use axum::http::StatusCode;
+    use dementia_research_web::web::build_router;
     use tower::ServiceExt;
 
-    let dir = std::env::temp_dir().join(format!("dra-test-{}", uuid::Uuid::new_v4()));
-    let state = AppState::new(
-        LibraryStore::new(dir.join("library.json")),
-        KeychainStore::in_memory(),
-    )
-    .expect("state");
+    let (state, dir) = fresh_state();
     let csrf = state.csrf_token.clone();
+    let session = state.session_token.clone();
     let app = build_router(state);
 
-    let sign_in = |host: &'static str, token: String| {
+    let sign_in = move |host: &'static str, token: String| {
         Request::builder()
             .method(Method::POST)
             .uri("/chatgpt/sign-in")
             .header(header::HOST, host)
+            .header(header::COOKIE, format!("{SESSION_COOKIE}={session}"))
             .header(header::ORIGIN, format!("http://{host}"))
             .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
             .body(Body::from(format!("csrf_token={token}")))
@@ -389,7 +422,10 @@ async fn continue_with_chatgpt_redirects_to_openai_with_loopback_callback() {
     assert_eq!(forged.status(), StatusCode::FORBIDDEN);
 
     // A callback that does not match the pending sign-in is refused without saving anything.
+    // The callback needs no session cookie (it is bound to the sign-in by `state`), but it
+    // must still be addressed to the loopback host.
     let callback = Request::get("/auth/callback?code=abc&state=forged&client_id=oaiapp_x")
+        .header(header::HOST, "127.0.0.1:18080")
         .body(Body::empty())
         .expect("request");
     let response = app.oneshot(callback).await.expect("response");
@@ -479,22 +515,18 @@ fn openai_model_list_keeps_only_text_generation_models() {
 #[tokio::test]
 async fn loop_page_offers_automatic_model_and_explains_missing_providers() {
     use axum::body::Body;
-    use axum::http::Request;
-    use dementia_research_web::providers::KeychainStore;
-    use dementia_research_web::store::LibraryStore;
-    use dementia_research_web::web::{build_router, AppState};
+    use dementia_research_web::web::build_router;
     use http_body_util::BodyExt;
     use tower::ServiceExt;
 
-    let dir = std::env::temp_dir().join(format!("dra-test-{}", uuid::Uuid::new_v4()));
-    let state = AppState::new(
-        LibraryStore::new(dir.join("library.json")),
-        KeychainStore::in_memory(),
-    )
-    .expect("state");
-    let app = build_router(state);
+    let (state, dir) = fresh_state();
+    let app = build_router(state.clone());
     let response = app
-        .oneshot(Request::get("/?section=loop").body(Body::empty()).expect("request"))
+        .oneshot(
+            owner_request(&state, Method::GET, "/?section=loop")
+                .body(Body::empty())
+                .expect("request"),
+        )
         .await
         .expect("response");
     let html = String::from_utf8(
@@ -564,10 +596,10 @@ async fn rejected_keys_are_removed_unless_already_replaced() {
 #[tokio::test]
 async fn credentials_form_saves_valid_keys_and_explains_rejected_ones() {
     use axum::body::Body;
-    use axum::http::{Method, Request, StatusCode};
+    use axum::http::StatusCode;
     use dementia_research_web::providers::KeychainStore;
     use dementia_research_web::store::LibraryStore;
-    use dementia_research_web::web::{build_router, AppState};
+    use dementia_research_web::web::build_router;
     use http_body_util::BodyExt;
     use tower::ServiceExt;
 
@@ -576,7 +608,7 @@ async fn credentials_form_saves_valid_keys_and_explains_rejected_ones() {
     let state = AppState::new(LibraryStore::new(dir.join("library.json")), keychain.clone())
         .expect("state");
     let csrf = state.csrf_token.clone();
-    let app = build_router(state);
+    let app = build_router(state.clone());
 
     let openai = format!("sk-proj-{}", "b".repeat(48));
     let body = format!(
@@ -585,9 +617,7 @@ async fn credentials_form_saves_valid_keys_and_explains_rejected_ones() {
     let response = app
         .clone()
         .oneshot(
-            Request::builder()
-                .method(Method::POST)
-                .uri("/credentials")
+            owner_request(&state, Method::POST, "/credentials")
                 .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
                 .body(Body::from(body))
                 .expect("request"),
@@ -599,7 +629,11 @@ async fn credentials_form_saves_valid_keys_and_explains_rejected_ones() {
     assert_eq!(keychain.get("openai_api_key").as_deref(), Some(openai.as_str()));
 
     let page = app
-        .oneshot(Request::get("/?section=sources").body(Body::empty()).expect("request"))
+        .oneshot(
+            owner_request(&state, Method::GET, "/?section=sources")
+                .body(Body::empty())
+                .expect("request"),
+        )
         .await
         .expect("response");
     let html = String::from_utf8(page.into_body().collect().await.expect("body").to_bytes().to_vec())
@@ -643,4 +677,502 @@ fn only_a_401_naming_the_key_as_invalid_counts_as_an_invalid_key() {
     assert!(!invalid(OpenAi, 401, anthropic_auth));
     assert!(!invalid(Anthropic, 401, openai_invalid));
     assert!(!invalid(ChatGpt, 401, openai_invalid));
+}
+
+#[tokio::test]
+async fn local_clients_are_refused_until_the_start_link_is_opened() {
+    use axum::body::Body;
+    use axum::http::StatusCode;
+    use dementia_research_web::web::build_router;
+    use tower::ServiceExt;
+
+    let (state, dir) = fresh_state();
+    let csrf = state.csrf_token.clone();
+    let app = build_router(state.clone());
+    let anonymous = |method: Method, uri: &str| {
+        Request::builder()
+            .method(method)
+            .uri(uri)
+            .header(header::HOST, "127.0.0.1:8080")
+    };
+
+    // Another local process can connect to the loopback port, but gets nothing without
+    // the session cookie: no page, no export, no event stream, no action.
+    for uri in ["/", "/?section=library", "/export/library.json", "/export/library.md", "/events"] {
+        let response = app
+            .clone()
+            .oneshot(anonymous(Method::GET, uri).body(Body::empty()).expect("request"))
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{uri}");
+    }
+    let post = anonymous(Method::POST, "/domain")
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .body(Body::from(format!("csrf_token={csrf}&domain=cancer")))
+        .expect("request");
+    let response = app.clone().oneshot(post).await.expect("response");
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        state.library.read().await.pipeline.settings.domain(),
+        ResearchDomain::Dementia
+    );
+
+    // The stylesheet and script hold nothing private.
+    let css = app
+        .clone()
+        .oneshot(anonymous(Method::GET, "/static/app.css").body(Body::empty()).expect("request"))
+        .await
+        .expect("response");
+    assert_eq!(css.status(), StatusCode::OK);
+
+    // A wrong token does not start a session; the right one sets the cookie and drops the
+    // token from the address.
+    let wrong = app
+        .clone()
+        .oneshot(anonymous(Method::GET, "/?token=nope").body(Body::empty()).expect("request"))
+        .await
+        .expect("response");
+    assert_eq!(wrong.status(), StatusCode::UNAUTHORIZED);
+    assert!(wrong.headers().get(header::SET_COOKIE).is_none());
+
+    let start = format!("/?token={}", state.bootstrap_token);
+    let started = app
+        .clone()
+        .oneshot(anonymous(Method::GET, &start).body(Body::empty()).expect("request"))
+        .await
+        .expect("response");
+    assert_eq!(started.status(), StatusCode::SEE_OTHER);
+    assert_eq!(started.headers()[header::LOCATION], "/");
+    let cookie = started.headers()[header::SET_COOKIE].to_str().expect("cookie");
+    assert!(cookie.starts_with(&format!("{SESSION_COOKIE}={}", state.session_token)));
+    assert!(cookie.contains("HttpOnly") && cookie.contains("SameSite=Lax"));
+    assert_eq!(state.start_link(&"127.0.0.1:8080".parse().unwrap()), format!("http://127.0.0.1:8080{start}"));
+
+    // With the cookie, every loopback spelling works.
+    for host in ["127.0.0.1:8080", "localhost:8080", "[::1]:8080"] {
+        let response = app
+            .clone()
+            .oneshot(
+                owner_request_at(&state, Method::GET, "/", host)
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK, "{host}");
+    }
+
+    // A DNS name an attacker points at 127.0.0.1 is refused before any handler runs, cookie or not.
+    let rebound = app
+        .clone()
+        .oneshot(
+            owner_request_at(&state, Method::GET, "/export/library.json", "research.attacker.example")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(rebound.status(), StatusCode::MISDIRECTED_REQUEST);
+    // So is a request with two Host headers, whichever comes first.
+    let ambiguous = app
+        .oneshot(
+            owner_request(&state, Method::GET, "/")
+                .header(header::HOST, "research.attacker.example")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(ambiguous.status(), StatusCode::MISDIRECTED_REQUEST);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn only_the_csrf_protected_post_switches_the_research_field() {
+    use axum::body::Body;
+    use axum::http::StatusCode;
+    use dementia_research_web::web::build_router;
+    use http_body_util::BodyExt;
+    use tower::ServiceExt;
+
+    let (state, dir) = fresh_state();
+    let csrf = state.csrf_token.clone();
+    let app = build_router(state.clone());
+
+    // A navigation (which any site can induce) changes nothing.
+    let page = app
+        .clone()
+        .oneshot(
+            owner_request(&state, Method::GET, "/?domain=cancer&section=loop")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(page.status(), StatusCode::OK);
+    let html = String::from_utf8(page.into_body().collect().await.expect("body").to_bytes().to_vec())
+        .expect("utf8");
+    assert!(html.contains(r#"data-domain="dementia""#));
+    assert_eq!(
+        state.library.read().await.pipeline.settings.domain(),
+        ResearchDomain::Dementia
+    );
+    assert!(!dir.join("library.json").exists(), "a GET must not save the library");
+
+    let switched = app
+        .oneshot(
+            owner_request(&state, Method::POST, "/domain")
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .body(Body::from(format!("csrf_token={csrf}&domain=cancer")))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(switched.status(), StatusCode::SEE_OTHER);
+    assert_eq!(
+        state.library.read().await.pipeline.settings.domain(),
+        ResearchDomain::Cancer
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn every_model_call_counts_against_the_daily_budget() {
+    use dementia_research_web::agents::GenerateFn;
+    use dementia_research_web::models::ResearchError;
+    use dementia_research_web::store::LibraryStore;
+    use dementia_research_web::web::budgeted_generate;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let (state, dir) = fresh_state();
+    state.library.write().await.pipeline.settings.daily_model_budget = 2;
+    let sent = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&sent);
+    let provider: GenerateFn<'static> = Box::new(move |_system, _prompt| {
+        counter.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async { Ok("{}".to_string()) })
+    });
+    let generate = budgeted_generate(Arc::clone(&state), provider);
+
+    assert!(generate("s".into(), "p".into()).await.is_ok());
+    assert!(generate("s".into(), "repair".into()).await.is_ok());
+    let third = generate("s".into(), "p".into()).await;
+    assert!(matches!(third, Err(ResearchError::BudgetExhausted)), "{third:?}");
+    // The refused request never reached the provider.
+    assert_eq!(sent.load(Ordering::SeqCst), 2);
+    assert_eq!(state.library.read().await.pipeline.model_requests_today, 2);
+    assert!(!state.library.read().await.pipeline.model_budget_available(Utc::now()));
+    // The count is saved, so a restart cannot reset it.
+    let saved = LibraryStore::new(dir.join("library.json")).load().expect("load");
+    assert_eq!(saved.pipeline.model_requests_today, 2);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn json_export_redacts_restricted_bodies_in_every_record() {
+    use axum::body::Body;
+    use dementia_research_web::models::{
+        ConnectionReview, DiscoveryCycle, HypothesisValidation, LibrarySnapshot,
+        ValidationVerdict,
+    };
+    use dementia_research_web::web::build_router;
+    use http_body_util::BodyExt;
+    use tower::ServiceExt;
+
+    let sentinel = "RESTRICTED-BODY-SENTINEL-7f3a";
+    let paper = restricted_paper("MED:1", sentinel);
+    let mut lib = LibrarySnapshot::default();
+    lib.papers.push(paper.clone());
+    lib.pipeline.cycles.push(DiscoveryCycle {
+        dataset_records: None,
+        research_domain: None,
+        id: uuid::Uuid::new_v4(),
+        created_at: Utc::now(),
+        objective: "objective".to_string(),
+        landscape: Vec::new(),
+        hypotheses: Vec::new(),
+        papers: vec![paper.clone()],
+        audit: Vec::new(),
+        provider: "p".to_string(),
+        model: "m".to_string(),
+    });
+    lib.pipeline.connections.push(ConnectionReview {
+        dataset_records: None,
+        research_domain: None,
+        id: uuid::Uuid::new_v4(),
+        created_at: Utc::now(),
+        proposals: Vec::new(),
+        papers: vec![paper.clone()],
+        audit: Vec::new(),
+        provider: "p".to_string(),
+        model: "m".to_string(),
+    });
+    lib.pipeline.validations.push(HypothesisValidation {
+        dataset_records: None,
+        research_domain: None,
+        id: uuid::Uuid::new_v4(),
+        hypothesis_id: uuid::Uuid::new_v4(),
+        original_statement: "statement".to_string(),
+        created_at: Utc::now(),
+        verdict: ValidationVerdict::Unresolved,
+        confidence: "low".to_string(),
+        summary: String::new(),
+        criteria: Vec::new(),
+        claims: Vec::new(),
+        evidence: Vec::new(),
+        can_conclude: String::new(),
+        cannot_conclude: String::new(),
+        would_change_assessment: String::new(),
+        next_test: String::new(),
+        limitations: Vec::new(),
+        papers: vec![paper.clone()],
+        audit: Vec::new(),
+        provider: "p".to_string(),
+        model: "m".to_string(),
+        proposed_revision: None,
+        supplied_citation_checks: None,
+    });
+    assert_eq!(
+        serde_json::to_string(&lib).unwrap().matches(sentinel).count(),
+        4,
+        "the fixture holds the body in all four places"
+    );
+
+    let (state, dir) = fresh_state();
+    *state.library.write().await = lib;
+    let app = build_router(state.clone());
+    let response = app
+        .oneshot(
+            owner_request(&state, Method::GET, "/export/library.json")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    let json = String::from_utf8(response.into_body().collect().await.expect("body").to_bytes().to_vec())
+        .expect("utf8");
+    assert!(!json.contains(sentinel), "a restricted body leaked into the export");
+    // Metadata and provenance stay.
+    assert_eq!(json.matches("L1 drives IFN in senescent cells").count(), 4);
+    assert!(json.contains("abc123"));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn tdm_redirects_send_publisher_credentials_only_to_the_publisher() {
+    use dementia_research_web::literature::{tdm_destination_allowed, tdm_hop_headers};
+
+    for allowed in ["https://api.elsevier.com/content/x", "https://cdn.elsevier.com/x?y=1"] {
+        assert!(tdm_destination_allowed(&Url::parse(allowed).unwrap()), "{allowed}");
+    }
+    for blocked in [
+        "http://api.elsevier.com/content/x",
+        "https://api.elsevier.com:8443/content/x",
+        "https://10.0.0.5/metadata",
+        "https://[::1]/metadata",
+        "https://169.254.169.254/latest",
+        "https://user@api.elsevier.com/x",
+        "https://api.elsevier.com./x",
+    ] {
+        assert!(!tdm_destination_allowed(&Url::parse(blocked).unwrap()), "{blocked}");
+    }
+
+    let mut headers = HeaderMap::new();
+    headers.insert("X-ELS-APIKey", HeaderValue::from_static("els-key"));
+    headers.insert("X-ELS-Insttoken", HeaderValue::from_static("inst-token"));
+    headers.insert("Wiley-TDM-Client-Token", HeaderValue::from_static("wiley"));
+    headers.insert(header::ACCEPT, HeaderValue::from_static("text/xml"));
+
+    let publisher = tdm_hop_headers("api.elsevier.com", &Url::parse("https://API.Elsevier.com/content/x").unwrap(), &headers);
+    assert!(publisher.contains_key("X-ELS-APIKey") && publisher.contains_key("X-ELS-Insttoken"));
+
+    // Any hop to another host, first or later, carries no credential.
+    let cdn = tdm_hop_headers("api.elsevier.com", &Url::parse("https://cdn.elsevier.com/x").unwrap(), &headers);
+    assert!(!cdn.contains_key("X-ELS-APIKey"));
+    assert!(!cdn.contains_key("X-ELS-Insttoken"));
+    assert!(!cdn.contains_key("Wiley-TDM-Client-Token"));
+    assert_eq!(cdn[header::ACCEPT], "text/xml");
+}
+
+#[test]
+fn bodies_stay_local_unless_their_licence_is_known_to_allow_redistribution() {
+    use dementia_research_web::models::license_permits_redistribution;
+
+    let with = |license: Option<&str>, url: Option<&str>, format: &str, record_license: Option<&str>| Paper {
+        id: "MED:2".to_string(),
+        title: "Paper".to_string(),
+        is_open_access: true,
+        license: record_license.map(str::to_string),
+        full_text: Some(ArticleText {
+            passages: vec![Passage {
+                id: "p1".to_string(),
+                section: "Results".to_string(),
+                text: "Body".to_string(),
+            }],
+            format: format.to_string(),
+            source_url: Url::parse("https://europepmc.org/x").unwrap(),
+            retrieved_at: Utc::now(),
+            checksum: "c".to_string(),
+            license: license.map(str::to_string),
+            version: None,
+            license_url: url.map(|u| Url::parse(u).unwrap()),
+        }),
+        ..Paper::default()
+    };
+
+    // Known open licences, by wording or by URL.
+    assert!(!with(Some("This is an open access article distributed under the terms of the Creative Commons Attribution License"), None, "JATS XML", None).is_body_redistribution_restricted());
+    assert!(!with(None, Some("https://creativecommons.org/licenses/by-nc-nd/4.0/"), "JATS XML", None).is_body_redistribution_restricted());
+    assert!(!with(None, None, "JATS XML", Some("cc by")).is_body_redistribution_restricted());
+    assert!(!with(Some("CC0 1.0 Universal"), None, "BioC JSON", None).is_body_redistribution_restricted());
+
+    // Unknown, missing or restrictive terms keep the body local.
+    assert!(with(None, None, "JATS XML", None).is_body_redistribution_restricted());
+    assert!(with(Some("Licence: see publisher"), None, "JATS XML", None).is_body_redistribution_restricted());
+    assert!(with(Some("© 2024 The Authors. All rights reserved."), None, "JATS XML", None).is_body_redistribution_restricted());
+    // The more restrictive statement wins when the record and the document disagree.
+    assert!(with(Some("All rights reserved"), Some("https://creativecommons.org/licenses/by/4.0/"), "JATS XML", Some("cc by")).is_body_redistribution_restricted());
+    // Institutional copies are never redistributable, whatever the licence text.
+    assert!(with(Some("cc by"), None, "Elsevier TDM XML", None).is_body_redistribution_restricted());
+    // No body, nothing to keep local.
+    assert!(!Paper { id: "MED:3".to_string(), is_open_access: true, ..Paper::default() }.is_body_redistribution_restricted());
+
+    assert!(license_permits_redistribution(["cc-by-sa"], None));
+    assert!(!license_permits_redistribution(["cc by", "not for redistribution"], None));
+    assert!(!license_permits_redistribution(std::iter::empty(), None));
+}
+
+#[test]
+fn quote_matcher_rejects_quotes_longer_than_the_maximum() {
+    let passage = "word ".repeat(200);
+    let short = "word ".repeat(10).trim().to_string();
+    assert!(QuoteMatcher::locate(&short, &passage).is_some());
+    let long = "word ".repeat(90).trim().to_string();
+    assert!(long.len() > QuoteMatcher::MAXIMUM_LENGTH);
+    assert!(QuoteMatcher::locate(&long, &passage).is_none());
+}
+
+#[test]
+fn report_stops_reproducing_restricted_quotations_past_the_allowance() {
+    use dementia_research_web::models::{HypothesisDraft, HypothesisOrigin, QueuedHypothesis};
+    use dementia_research_web::report::RESTRICTED_QUOTE_ALLOWANCE;
+
+    let body = "sentence ".repeat(120);
+    let paper = restricted_paper("MED:4", body.trim());
+    let quote = "sentence ".repeat(44).trim().to_string();
+    assert!(quote.len() <= QuoteMatcher::MAXIMUM_LENGTH && 3 * quote.len() > RESTRICTED_QUOTE_ALLOWANCE);
+    let mut draft = HypothesisDraft::minimal("Title", "Statement under test");
+    draft.citations = (0..3)
+        .map(|i| EvidenceCitation::new("MED:4", "body-1", &quote, &format!("interpretation {i}")))
+        .collect();
+    let item = QueuedHypothesis::new(draft, HypothesisOrigin::Manual, ResearchDomain::Dementia);
+    let md = ResearchReportBuilder::hypothesis(&item, std::slice::from_ref(&paper)).markdown();
+    assert_eq!(md.matches(&quote).count(), 2, "{md}");
+    assert_eq!(md.matches("Quotation from MED:4 not reproduced").count(), 1);
+    assert_eq!(md.matches("interpretation").count(), 3, "every citation is still listed");
+    assert!(!md.contains(body.trim()));
+}
+
+#[test]
+fn xml_parsers_refuse_documents_nested_too_deeply() {
+    use dementia_research_web::parsers::{ElsevierArticleParser, MAX_XML_DEPTH};
+
+    let nested = |depth: usize| {
+        format!(
+            "<article><front><article-meta><article-title>Deep nesting test article title</article-title></article-meta></front><body>{}<p>Deep paragraph text long enough to count.</p>{}</body></article>",
+            "<sec>".repeat(depth),
+            "</sec>".repeat(depth)
+        )
+    };
+    let url = Url::parse("https://www.ebi.ac.uk/europepmc/webservices/rest/PMC1/fullTextXML").unwrap();
+    assert!(ArticleTextParser::jats(nested(40).as_bytes(), url.clone(), Some("cc by")).is_ok());
+
+    // Within the node limit, but deep enough to overflow the parser's recursion (one frame
+    // per level), so it must be refused before parsing.
+    let deep = nested(MAX_XML_DEPTH + 20_000);
+    let err = ArticleTextParser::jats(deep.as_bytes(), url.clone(), None).unwrap_err().to_string();
+    assert!(err.contains("nested too deeply"), "{err}");
+    let paper = Paper { title: "Deep nesting test article title".to_string(), ..Paper::default() };
+    assert!(ArticleTextParser::validate_xml_identity(deep.as_bytes(), &paper).is_err());
+
+    let elsevier = format!(
+        "<full-text-retrieval-response><coredata><doi>10.1016/j.test.2024.001</doi></coredata><originalText>{}<para>Elsevier body text.</para>{}</originalText></full-text-retrieval-response>",
+        "<section>".repeat(MAX_XML_DEPTH + 20_000),
+        "</section>".repeat(MAX_XML_DEPTH + 20_000)
+    );
+    let elsevier_url = Url::parse("https://api.elsevier.com/content/article/doi/10.1016/j.test.2024.001").unwrap();
+    assert!(ElsevierArticleParser::parse(elsevier.as_bytes(), elsevier_url, "10.1016/j.test.2024.001", "tdm").is_err());
+}
+
+#[test]
+fn full_text_is_attached_only_when_the_document_identifies_the_requested_paper() {
+    use dementia_research_web::parsers::ElsevierArticleParser;
+
+    let bioc_url = Url::parse("https://www.ncbi.nlm.nih.gov/research/bionlp/RESTful/pmcoa.cgi/BioC_json/PMC6500498/unicode").unwrap();
+    let bioc = |id_field: &str| {
+        format!(
+            r#"{{"documents":[{{{id_field}"passages":[{{"infons":{{"section_type":"RESULTS","type":"paragraph"}},"text":"Body text long enough to count as a passage here."}}]}}]}}"#
+        )
+    };
+    assert!(ArticleTextParser::bioc(bioc(r#""id":"6500498","#).as_bytes(), bioc_url.clone(), None, Some("PMC6500498")).is_ok());
+    assert!(ArticleTextParser::bioc(bioc(r#""id":"PMC6500498","#).as_bytes(), bioc_url.clone(), None, Some("pmc6500498")).is_ok());
+    let other = ArticleTextParser::bioc(bioc(r#""id":"111","#).as_bytes(), bioc_url.clone(), None, Some("PMC6500498")).unwrap_err().to_string();
+    assert!(other.contains("describes PMC111"), "{other}");
+    let anonymous = ArticleTextParser::bioc(bioc("").as_bytes(), bioc_url.clone(), None, Some("PMC6500498")).unwrap_err().to_string();
+    assert!(anonymous.contains("no PMC identifier"), "{anonymous}");
+
+    let elsevier = |doi_element: &str| {
+        format!(
+            r#"<full-text-retrieval-response xmlns:prism="http://prismstandard.org/namespaces/basic/2.0/"><coredata>{doi_element}</coredata><originalText><section-title>Results</section-title><para>Elsevier body paragraph text that is long enough.</para></originalText></full-text-retrieval-response>"#
+        )
+    };
+    let elsevier_url = Url::parse("https://api.elsevier.com/content/article/doi/10.1016/j.test.2024.001").unwrap();
+    let wanted = "10.1016/j.test.2024.001";
+    assert!(ElsevierArticleParser::parse(elsevier("<prism:doi>10.1016/j.test.2024.001</prism:doi>").as_bytes(), elsevier_url.clone(), wanted, "tdm").is_ok());
+    assert!(ElsevierArticleParser::parse(elsevier("<prism:doi>10.1016/j.other.2024.009</prism:doi>").as_bytes(), elsevier_url.clone(), wanted, "tdm").is_err());
+    let no_doi = ElsevierArticleParser::parse(elsevier("").as_bytes(), elsevier_url, wanted, "tdm").unwrap_err().to_string();
+    assert!(no_doi.contains("no readable DOI"), "{no_doi}");
+
+    // A matching title does not excuse a conflicting identifier.
+    let jats = r#"<article><front><article-meta><article-title>A sufficiently long article title for matching</article-title><article-id pub-id-type="doi">10.1000/other</article-id></article-meta></front><body><p>Body.</p></body></article>"#;
+    let same_title_other_doi = Paper {
+        title: "A sufficiently long article title for matching".to_string(),
+        doi: Some("10.1000/mine".to_string()),
+        ..Paper::default()
+    };
+    assert!(ArticleTextParser::validate_xml_identity(jats.as_bytes(), &same_title_other_doi).is_err());
+    let same_title_no_doi = Paper { doi: None, ..same_title_other_doi.clone() };
+    assert!(ArticleTextParser::validate_xml_identity(jats.as_bytes(), &same_title_no_doi).is_ok());
+    let same_doi = Paper { title: "Different".to_string(), doi: Some("https://doi.org/10.1000/OTHER".to_string()), ..Paper::default() };
+    assert!(ArticleTextParser::validate_xml_identity(jats.as_bytes(), &same_doi).is_ok());
+}
+
+#[test]
+fn xml_text_is_collected_once_per_text_node() {
+    use dementia_research_web::parsers::{xml_nesting_depth, ElsevierArticleParser};
+
+    let xml = r#"<article><front><article-meta><article-title>A title long enough for identity matching</article-title></article-meta></front><body><sec><title>Results</title><p>Hello <italic>world</italic>, again.<xref ref-type="bibr">1</xref></p></sec></body></article>"#;
+    let url = Url::parse("https://www.ebi.ac.uk/europepmc/webservices/rest/PMC1/fullTextXML").unwrap();
+    let article = ArticleTextParser::jats(xml.as_bytes(), url, Some("cc by")).expect("parsed");
+    assert_eq!(article.passages.len(), 1);
+    assert_eq!(article.passages[0].section, "Results");
+    assert_eq!(article.passages[0].text, "Hello world, again.1");
+
+    // Titles compare exactly, so a paper can be tied to its XML by title alone.
+    let paper = Paper {
+        title: "A title long enough for identity matching".to_string(),
+        ..Paper::default()
+    };
+    ArticleTextParser::validate_xml_identity(xml.as_bytes(), &paper).expect("title matches");
+
+    // And an Elsevier DOI is read once, so a matching response is accepted.
+    let elsevier = r#"<full-text-retrieval-response xmlns:prism="http://prismstandard.org/namespaces/basic/2.0/"><coredata><prism:doi>10.1016/j.test.2024.001</prism:doi></coredata><originalText><section-title>Results</section-title><para>Elsevier <b>body</b> paragraph.</para></originalText></full-text-retrieval-response>"#;
+    let elsevier_url = Url::parse("https://api.elsevier.com/content/article/doi/10.1016/j.test.2024.001").unwrap();
+    let parsed = ElsevierArticleParser::parse(elsevier.as_bytes(), elsevier_url, "10.1016/j.test.2024.001", "tdm").expect("parsed");
+    assert_eq!(parsed.passages[0].text, "Elsevier body paragraph.");
+    assert_eq!(parsed.passages[0].section, "Results");
+
+    // The markup scan that guards the parser counts nesting, not angle brackets in other places.
+    assert_eq!(xml_nesting_depth(r#"<a><!-- <x><y> --><b attr="<c><d>"><![CDATA[<e><f><g>]]><?pi <h>?><i/></b></a>"#), 2);
+    assert_eq!(xml_nesting_depth("<a><b><c></c></b><d/></a>"), 3);
 }

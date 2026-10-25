@@ -17,7 +17,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("No system secret store was found, so API keys are kept in an owner-only file instead.");
     }
     let state = AppState::new(store, keychain)?;
-    let app = build_router(state);
+    let app = build_router(state.clone());
 
     // Loopback-only binding by default so local research state and Keychain-backed routes
     // are never exposed to LAN interfaces.
@@ -32,6 +32,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     println!("Medical Research Agent (Hardened Rust/Axum SSR) listening on http://{addr}");
+    println!();
+    println!("Open this start link in your browser (it sets the session cookie; every other");
+    println!("local client, including other users on this computer, is refused):");
+    println!("  {}", state.start_link(&addr));
+    println!();
     let listener = TcpListener::bind(addr).await?;
     axum::serve(listener, app).await?;
     Ok(())

@@ -3,8 +3,13 @@ use crate::models::{
     LibrarySnapshot, Paper, QueuedHypothesis, ResearchDatasetRecord, ResearchDomain,
 };
 use chrono::{DateTime, Utc};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use url::Url;
+
+/// Characters of verified quotation one hypothesis or claim may reproduce from a paper
+/// whose body is not redistributable. Later quotations from that paper are listed by
+/// passage but not reproduced.
+pub const RESTRICTED_QUOTE_ALLOWANCE: usize = 1_000;
 
 const SCOPE_DISCLAIMER: &str = "Exploratory research record. Literature support is not experimental validation, a statistical correlation or a patient-specific treatment recommendation.";
 
@@ -480,11 +485,23 @@ impl ResearchReportBuilder {
         papers: &[Paper],
         report: &mut ResearchReport,
     ) {
+        let mut quoted: HashMap<&str, usize> = HashMap::new();
         for cit in citations {
-            report
-                .blocks
-                .push(ResearchReportBlock::Quote(format!("“{}”", cit.quote)));
             let paper = papers.iter().find(|p| p.id == cit.paper_id);
+            let restricted = paper.is_some_and(Paper::is_body_redistribution_restricted);
+            let used = quoted.entry(cit.paper_id.as_str()).or_insert(0);
+            let length = cit.quote.chars().count();
+            if restricted && *used + length > RESTRICTED_QUOTE_ALLOWANCE {
+                report.blocks.push(ResearchReportBlock::Paragraph(format!(
+                    "Quotation from {} not reproduced: this section's quotation allowance for a source without an open redistribution licence was reached.",
+                    cit.paper_id
+                )));
+            } else {
+                *used += length;
+                report
+                    .blocks
+                    .push(ResearchReportBlock::Quote(format!("“{}”", cit.quote)));
+            }
             let title = paper.map(|p| p.citation()).unwrap_or_default();
             report.field(
                 "Source passage",

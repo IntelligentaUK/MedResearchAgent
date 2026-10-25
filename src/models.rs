@@ -231,23 +231,23 @@ impl Paper {
         self.has_free_full_text_route() || access.publisher_for(self.doi.as_deref()).is_some()
     }
 
-    /// True when the stored article body was retrieved under text-mining terms (an un-licensed PMC author
-    /// manuscript or an institutional TDM copy) that permit short verified quotations but not body redistribution.
+    /// True unless the stored article body is known to be redistributable: an author
+    /// manuscript without an open licence, an institutional TDM copy, any licence that
+    /// forbids redistribution, and any unknown or missing licence all keep the body local.
+    /// Short verified quotations remain allowed either way. Where the record and the
+    /// document disagree, the more restrictive reading wins.
     pub fn is_body_redistribution_restricted(&self) -> bool {
-        (self.is_author_manuscript && !self.is_open_access)
-            || self
-                .full_text
-                .as_ref()
-                .is_some_and(|t| t.format.contains("TDM"))
-            || self
-                .full_text
-                .as_ref()
-                .and_then(|t| t.license.as_deref())
-                .is_some_and(|l| {
-                    let lower = l.to_lowercase();
-                    lower.contains("no open redistribution")
-                        || lower.contains("not for redistribution")
-                })
+        if self.is_author_manuscript && !self.is_open_access {
+            return true;
+        }
+        let Some(ref text) = self.full_text else {
+            return false;
+        };
+        if text.format.contains("TDM") {
+            return true;
+        }
+        let statements = [text.license.as_deref(), self.license.as_deref()];
+        !license_permits_redistribution(statements.into_iter().flatten(), text.license_url.as_ref())
     }
 
     pub fn is_conference_abstract(&self) -> bool {
@@ -327,6 +327,49 @@ pub fn normalize_doi(raw: Option<&str>) -> Option<String> {
     } else {
         None
     }
+}
+
+/// Licence wordings and URLs that permit the article body to be redistributed. The list is an
+/// allowlist: a licence that matches none of them, or no licence at all, keeps the body local.
+const REDISTRIBUTABLE_LICENSE_MARKERS: &[&str] = &[
+    "creativecommons.org/licenses/",
+    "creativecommons.org/publicdomain/",
+    "creative commons attribution",
+    "creative commons zero",
+    "cc by",
+    "cc-by",
+    "cc0",
+    "public domain",
+];
+
+/// Wordings that forbid redistribution; any one of them outweighs a permissive marker.
+const RESTRICTED_LICENSE_MARKERS: &[&str] = &[
+    "no open redistribution",
+    "not for redistribution",
+    "no redistribution",
+    "all rights reserved",
+];
+
+/// Whether the licence statements (from the record and the document) and licence URL,
+/// taken together, establish that the article body may be redistributed. Unknown, missing
+/// or conflicting terms do not.
+pub fn license_permits_redistribution<'a>(
+    statements: impl IntoIterator<Item = &'a str>,
+    license_url: Option<&Url>,
+) -> bool {
+    let mut text: String = statements
+        .into_iter()
+        .map(str::to_lowercase)
+        .collect::<Vec<_>>()
+        .join(" ");
+    if let Some(url) = license_url {
+        text.push(' ');
+        text.push_str(&url.as_str().to_lowercase());
+    }
+    if RESTRICTED_LICENSE_MARKERS.iter().any(|m| text.contains(m)) {
+        return false;
+    }
+    REDISTRIBUTABLE_LICENSE_MARKERS.iter().any(|m| text.contains(m))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1137,6 +1180,14 @@ impl ResearchPipeline {
         }
     }
 
+    /// Whether at least one more model request fits in today's budget. Does not reserve one.
+    pub fn model_budget_available(&self, now: DateTime<Utc>) -> bool {
+        self.model_usage_date.date_naive() != now.date_naive()
+            || self.model_requests_today < self.settings.daily_model_budget
+    }
+
+    /// Counts one attempted model request against the daily budget. Called before every
+    /// outbound provider call, so the count matches what the provider is asked for.
     pub fn reserve_model_request(&mut self, now: DateTime<Utc>) -> Result<(), ResearchError> {
         if self.model_usage_date.date_naive() != now.date_naive() {
             self.model_usage_date = now;
@@ -1266,6 +1317,28 @@ impl LibrarySnapshot {
             .or_default();
         if !domains.contains(&domain) {
             domains.push(domain);
+        }
+    }
+
+    /// Every stored copy of every paper: the library plus each validation, discovery cycle
+    /// and connection review, which keep their own `Paper` copies.
+    pub fn all_papers_mut(&mut self) -> impl Iterator<Item = &mut Paper> {
+        self.papers
+            .iter_mut()
+            .chain(self.pipeline.validations.iter_mut().flat_map(|v| v.papers.iter_mut()))
+            .chain(self.pipeline.cycles.iter_mut().flat_map(|c| c.papers.iter_mut()))
+            .chain(self.pipeline.connections.iter_mut().flat_map(|c| c.papers.iter_mut()))
+    }
+
+    /// Removes article bodies that may not be redistributed from every copy of every paper,
+    /// for exports. Metadata, checksums and verified quotations are kept.
+    pub fn redact_restricted_bodies(&mut self) {
+        for paper in self.all_papers_mut() {
+            if paper.is_body_redistribution_restricted() {
+                if let Some(ref mut ft) = paper.full_text {
+                    ft.passages.clear();
+                }
+            }
         }
     }
 

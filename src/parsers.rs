@@ -17,6 +17,103 @@ static HTML_TAG_RE: LazyLock<Regex> =
 static BLOCK_TAG_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)</?(p|h[1-6]|br|div|title)\b[^>]*>").expect("valid regex"));
 
+/// Deepest element nesting accepted from remote XML. Articles nest a few dozen levels; the
+/// recursive JATS walkers would overflow the stack on a document nested thousands deep while
+/// still within the node limit.
+pub const MAX_XML_DEPTH: usize = 256;
+
+/// The deepest element nesting in XML text, found by scanning the markup without parsing it.
+/// roxmltree's parser recurses once per nesting level, so this runs first. Comments, CDATA
+/// sections and processing instructions are skipped; quoted attribute values may hold `>`.
+/// On malformed markup it over-counts rather than under-counts.
+pub fn xml_nesting_depth(text: &str) -> usize {
+    let bytes = text.as_bytes();
+    let (mut i, mut depth, mut deepest) = (0usize, 0usize, 0usize);
+    while i < bytes.len() {
+        if bytes[i] != b'<' {
+            i += 1;
+            continue;
+        }
+        let rest = &text[i..];
+        let skip_to = |end: &str| rest.find(end).map_or(bytes.len(), |at| i + at + end.len());
+        if rest.starts_with("<!--") {
+            i = skip_to("-->");
+            continue;
+        }
+        if rest.starts_with("<![CDATA[") {
+            i = skip_to("]]>");
+            continue;
+        }
+        if rest.starts_with("<?") {
+            i = skip_to("?>");
+            continue;
+        }
+        if rest.starts_with("<!") {
+            i = skip_to(">");
+            continue;
+        }
+        let closing = rest.starts_with("</");
+        let mut j = i + 1;
+        let mut quote: Option<u8> = None;
+        while j < bytes.len() {
+            let b = bytes[j];
+            match quote {
+                Some(q) if b == q => quote = None,
+                Some(_) => {}
+                None if b == b'"' || b == b'\'' => quote = Some(b),
+                None if b == b'>' => break,
+                None => {}
+            }
+            j += 1;
+        }
+        if j >= bytes.len() {
+            break;
+        }
+        if closing {
+            depth = depth.saturating_sub(1);
+        } else if bytes[j - 1] != b'/' {
+            depth += 1;
+            deepest = deepest.max(depth);
+        }
+        i = j + 1;
+    }
+    deepest
+}
+
+/// Parses XML within the node limit and refuses documents nested deeper than
+/// `MAX_XML_DEPTH`, before the recursive parser sees them. The depth checks are iterative,
+/// so they cannot overflow themselves.
+fn parse_bounded_xml<'a>(text: &'a str, failure: &str) -> Result<Document<'a>, ResearchError> {
+    if xml_nesting_depth(text) > MAX_XML_DEPTH {
+        return Err(ResearchError::InvalidResponse(
+            "The XML is nested too deeply to be an article and was not read.".to_string(),
+        ));
+    }
+    let doc = Document::parse_with_options(
+        text,
+        ParsingOptions {
+            allow_dtd: true,
+            nodes_limit: 250_000,
+        },
+    )
+    .map_err(|_| ResearchError::InvalidResponse(failure.to_string()))?;
+    let mut pending = vec![(doc.root(), 0usize)];
+    while let Some((node, depth)) = pending.pop() {
+        if depth > MAX_XML_DEPTH {
+            return Err(ResearchError::InvalidResponse(
+                "The XML is nested too deeply to be an article and was not read.".to_string(),
+            ));
+        }
+        pending.extend(node.children().map(|child| (child, depth + 1)));
+    }
+    Ok(doc)
+}
+
+/// The digits of a PMC identifier, with any `PMC` prefix and surrounding space removed.
+fn pmc_digits(value: &str) -> String {
+    value.trim().to_uppercase().replace("PMC", "")
+}
+
 pub struct ArticleTextParser;
 
 impl ArticleTextParser {
@@ -37,16 +134,7 @@ impl ArticleTextParser {
             ));
         }
         let cleaned = DOCTYPE_RE.replace_all(&raw_text, "");
-        let doc = Document::parse_with_options(
-            &cleaned,
-            ParsingOptions {
-                allow_dtd: true,
-                nodes_limit: 250_000,
-            },
-        )
-        .map_err(|_| {
-            ResearchError::InvalidResponse("The full-text XML could not be parsed.".to_string())
-        })?;
+        let doc = parse_bounded_xml(&cleaned, "The full-text XML could not be parsed.")?;
 
         let mut passages: Vec<Passage> = Vec::new();
         let mut body_passage_count = 0usize;
@@ -192,10 +280,13 @@ impl ArticleTextParser {
         stack.pop();
     }
 
+    /// Reads a PMC BioC document. With `expected_pmcid`, the document must identify itself
+    /// as that article; a document with another or no PMC identifier is refused.
     pub fn bioc(
         data: &[u8],
         source_url: Url,
         fallback_license: Option<&str>,
+        expected_pmcid: Option<&str>,
     ) -> Result<ArticleText, ResearchError> {
         let json: Value = match serde_json::from_slice(data) {
             Ok(v) => v,
@@ -235,6 +326,32 @@ impl ArticleTextParser {
             ));
         }
         let doc = documents[0];
+        if let Some(expected) = expected_pmcid {
+            let expected = pmc_digits(expected);
+            let found = doc
+                .get("id")
+                .and_then(Value::as_str)
+                .or_else(|| {
+                    doc.get("infons")
+                        .and_then(|i| i.get("article-id_pmc"))
+                        .and_then(Value::as_str)
+                })
+                .map(pmc_digits)
+                .filter(|d| !d.is_empty());
+            match found {
+                Some(found) if found == expected => {}
+                Some(found) => {
+                    return Err(ResearchError::InvalidResponse(format!(
+                        "The BioC document describes PMC{found}, not the requested PMC{expected}."
+                    )))
+                }
+                None => {
+                    return Err(ResearchError::InvalidResponse(
+                        "The BioC document carries no PMC identifier, so it cannot be tied to the requested paper.".to_string(),
+                    ))
+                }
+            }
+        }
         let Some(raw_passages) = doc.get("passages").and_then(|p| p.as_array()) else {
             return Err(ResearchError::InvalidResponse(
                 "Expected exactly one BioC article with passages.".to_string(),
@@ -380,18 +497,7 @@ impl ArticleTextParser {
     pub fn validate_xml_identity(data: &[u8], paper: &Paper) -> Result<(), ResearchError> {
         let raw_text = Self::decode_xml_bytes(data)?;
         let cleaned = DOCTYPE_RE.replace_all(&raw_text, "");
-        let doc = Document::parse_with_options(
-            &cleaned,
-            ParsingOptions {
-                allow_dtd: true,
-                nodes_limit: 250_000,
-            },
-        )
-        .map_err(|_| {
-            ResearchError::InvalidResponse(
-                "The article identity could not be read from XML.".to_string(),
-            )
-        })?;
+        let doc = parse_bounded_xml(&cleaned, "The article identity could not be read from XML.")?;
 
         let mut xml_title = String::new();
         let mut xml_doi: Option<String> = None;
@@ -420,27 +526,37 @@ impl ArticleTextParser {
             }
         }
 
-        let doi_matches = normalize_doi(paper.doi.as_deref())
-            .is_some_and(|d| Some(d) == normalize_doi(xml_doi.as_deref()));
-        let pmid_matches = paper
-            .pmid
-            .as_deref()
-            .is_some_and(|p| xml_pmid.as_deref().map(str::trim) == Some(p.trim()));
-        let pmcid_matches = paper.pmcid.as_deref().is_some_and(|p| {
-            let a = p.trim().to_uppercase().replace("PMC", "");
-            let b = xml_pmcid
-                .as_deref()
-                .unwrap_or("")
-                .trim()
-                .to_uppercase()
-                .replace("PMC", "");
-            !a.is_empty() && a == b
-        });
+        let nonblank = |s: String| (!s.is_empty()).then_some(s);
+        let our_doi = normalize_doi(paper.doi.as_deref());
+        let their_doi = normalize_doi(xml_doi.as_deref());
+        let our_pmid = paper.pmid.as_deref().map(|p| p.trim().to_string()).and_then(nonblank);
+        let their_pmid = xml_pmid.as_deref().map(|p| p.trim().to_string()).and_then(nonblank);
+        let our_pmcid = paper.pmcid.as_deref().map(pmc_digits).and_then(nonblank);
+        let their_pmcid = xml_pmcid.as_deref().map(pmc_digits).and_then(nonblank);
+
+        // An identifier both sides state must agree; a matching title does not excuse a
+        // conflicting DOI, PMID or PMCID.
+        let conflicts = |ours: &Option<String>, theirs: &Option<String>| {
+            matches!((ours, theirs), (Some(a), Some(b)) if a != b)
+        };
+        if conflicts(&our_doi, &their_doi)
+            || conflicts(&our_pmid, &their_pmid)
+            || conflicts(&our_pmcid, &their_pmcid)
+        {
+            return Err(ResearchError::InvalidResponse(
+                "The XML identifiers describe a different article from the requested paper.".to_string(),
+            ));
+        }
+        let agrees = |ours: &Option<String>, theirs: &Option<String>| ours.is_some() && ours == theirs;
         let norm_paper_title = normalize_alnum(&paper.title);
         let title_matches =
             norm_paper_title.len() >= 20 && norm_paper_title == normalize_alnum(&xml_title);
 
-        if doi_matches || pmid_matches || pmcid_matches || title_matches {
+        if agrees(&our_doi, &their_doi)
+            || agrees(&our_pmid, &their_pmid)
+            || agrees(&our_pmcid, &their_pmcid)
+            || title_matches
+        {
             Ok(())
         } else {
             Err(ResearchError::InvalidResponse(
@@ -489,18 +605,7 @@ impl ElsevierArticleParser {
             ));
         }
         let cleaned = DOCTYPE_RE.replace_all(&raw_text, "");
-        let doc = Document::parse_with_options(
-            &cleaned,
-            ParsingOptions {
-                allow_dtd: true,
-                nodes_limit: 250_000,
-            },
-        )
-        .map_err(|_| {
-            ResearchError::InvalidResponse(
-                "The Elsevier TDM response is not well-formed XML.".to_string(),
-            )
-        })?;
+        let doc = parse_bounded_xml(&cleaned, "The Elsevier TDM response is not well-formed XML.")?;
 
         const EXCLUDED: &[&str] = &[
             "bibliography",
@@ -563,11 +668,19 @@ impl ElsevierArticleParser {
             }
         }
 
-        if let Some(found) = normalize_doi(found_doi.as_deref()) {
-            if Some(found.as_str()) != normalize_doi(Some(doi)).as_deref() {
+        // The response must say which article it is; a body with no readable DOI is not
+        // attached to the requested paper.
+        match normalize_doi(found_doi.as_deref()) {
+            Some(found) if Some(found.as_str()) == normalize_doi(Some(doi)).as_deref() => {}
+            Some(found) => {
                 return Err(ResearchError::InvalidResponse(format!(
                     "The Elsevier TDM response describes a different DOI ({found})."
-                )));
+                )))
+            }
+            None => {
+                return Err(ResearchError::InvalidResponse(
+                    "The Elsevier TDM response carries no readable DOI, so it cannot be tied to the requested article.".to_string(),
+                ))
             }
         }
 
@@ -612,14 +725,13 @@ impl MarkupText {
     }
 }
 
+/// The text of a node's text descendants, in order. Only text nodes are read: on an element,
+/// `Node::text()` returns its first text child, which would be counted twice.
 fn collect_all_text(node: Node<'_, '_>) -> String {
-    let mut out = String::new();
-    for desc in node.descendants() {
-        if let Some(t) = desc.text() {
-            out.push_str(t);
-        }
-    }
-    out
+    node.descendants()
+        .filter(|d| d.is_text())
+        .filter_map(|d| d.text())
+        .collect()
 }
 
 fn collect_jats_text(node: Node<'_, '_>, excluded: &[&str]) -> String {
@@ -635,8 +747,11 @@ fn collect_jats_text(node: Node<'_, '_>, excluded: &[&str]) -> String {
                 return;
             }
         }
-        if let Some(t) = n.text() {
-            out.push_str(t);
+        if n.is_text() {
+            if let Some(t) = n.text() {
+                out.push_str(t);
+            }
+            return;
         }
         for child in n.children() {
             visit(child, excluded, out);

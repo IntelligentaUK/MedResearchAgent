@@ -11,8 +11,9 @@ To minimize attack surface while handling untrusted scientific literature (JATS 
    - Built on **Axum** (`tokio-rs/axum`) and **Tower**, which have `#![forbid(unsafe_code)]` at the HTTP routing and extractor layer (unlike frameworks that rely on internal `unsafe` actor/pointer abstractions).
 2. **Pure-Rust TLS (`rustls`) — Zero OpenSSL C Surface**:
    - `reqwest` is compiled with `default-features = false` and `rustls-tls`, eliminating native OpenSSL/C memory-safety vulnerabilities.
-3. **Zero Client-Side Wasm/JS State Surface + Contextual HTML Auto-Escaping**:
-   - All 8 workspace views are server-rendered HTML with strict contextual escaping ([`html_escape`](src/web.rs)) and a locked-down Content Security Policy (`default-src 'self'; frame-ancestors 'none'`).
+3. **Server-Rendered Views, Minimal Same-Origin Script + Contextual HTML Auto-Escaping**:
+   - All 8 workspace views are server-rendered HTML with strict contextual escaping ([`html_escape`](src/web.rs)) and a locked-down Content Security Policy (`default-src 'self'; script-src 'self'; frame-ancestors 'none'`; no inline scripts).
+   - One small same-origin script (`/static/app.js`) keeps the activity panel live. It builds every element with `textContent` and holds no application state; without it, the pages still work and show progress on reload.
 4. **Constant-Time CSRF & Same-Origin Enforcement**:
    - Every state-changing `POST` endpoint validates a 256-bit session CSRF token in constant time using `subtle::ConstantTimeEq` ([`verify_csrf`](src/web.rs)) and enforces `Sec-Fetch-Site` (`same-origin` / `none`) + loopback `Origin` verification ([`same_origin_allowed`](src/web.rs)).
 5. **Loopback-Only Binding & OS Secret Storage**:
@@ -40,7 +41,9 @@ To minimize attack surface while handling untrusted scientific literature (JATS 
 - [`src/report.rs`](src/report.rs) — `ResearchReportBuilder` (Markdown and plain-text export with TDM/`AUTH_MAN:Y` body redaction).
 - [`src/store.rs`](src/store.rs) — Atomic `0600` `LibraryStore` persistence and citation re-verification on load.
 - [`src/swift_date.rs`](src/swift_date.rs) — Serde date format shared with the Swift app's `library.json` (seconds since 2001-01-01).
-- [`src/web.rs`](src/web.rs) — Axum router, CSP/security-header middleware, constant-time CSRF verification, and SSR HTML views.
+- [`src/web.rs`](src/web.rs) — Axum router, CSP/security-header middleware, constant-time CSRF verification, SSR HTML views, and the `/events` progress stream.
+- [`src/jobs.rs`](src/jobs.rs) — `JobRunner`: background research stages, one at a time, with progress broadcast to open pages.
+- [`src/model_catalog.rs`](src/model_catalog.rs) — Live per-provider model lists and the remembered model choice.
 - [`tests/core_tests.rs`](tests/core_tests.rs) — Unit and integration test suite.
 
 ## Building, Testing & Running
@@ -103,6 +106,10 @@ The first build downloads and compiles all dependencies and takes a few minutes.
 - **Plan usage**: requests count toward the user's ChatGPT plan, subject to OpenAI's eligibility rules (at launch: open-source projects, personal local projects and selected private apps). Users set per-app limits at [chatgpt.com/settings/usage](https://chatgpt.com/settings/usage). If plan usage was declined at sign-in, **Use your ChatGPT plan** asks again.
 - **Plan errors** such as **Usage limit reached** stop the run; the app never switches to another billing path on its own.
 - **Credentials**: tokens are stored in `chatgpt-auth.json` (and the installation's host ID in `chatgpt-host.json`) next to `library.json`, written atomically with `0600` permissions and never placed in the library, HTML or logs. Access tokens are refreshed automatically. **Sign out** revokes the session with OpenAI and deletes the tokens, keeping the registration for the next sign-in.
+
+### Live progress
+
+Discovery cycles, validations and connection reviews run in the background, one at a time. After you start one, an **activity panel** at the top of every page shows each step as it happens (model requests by phase, literature searches, full-text reads), streamed from `/events` (server-sent events). When the stage finishes, the panel shows the outcome and the page content updates in place with the new results; no manual refresh is needed. A stage keeps running if you close the page, and the panel shows its latest state when you return. Run buttons are disabled while a stage is running.
 
 ### Choosing a model
 

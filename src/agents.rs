@@ -25,11 +25,14 @@ pub type SearchFn<'a> = Box<
 >;
 pub type RetrieveFn<'a> =
     Box<dyn Fn(Paper) -> BoxFuture<'a, Result<ArticleText, ResearchError>> + Send + Sync + 'a>;
+/// Receives a short description of each step while an agent runs, for live display.
+pub type ProgressFn<'a> = Box<dyn Fn(String) + Send + Sync + 'a>;
 
 pub struct AutonomousDiscoveryAgent<'a> {
     pub generate: GenerateFn<'a>,
     pub search: SearchFn<'a>,
     pub retrieve: RetrieveFn<'a>,
+    pub progress: ProgressFn<'a>,
     pub access: InstitutionalAccess,
 }
 
@@ -396,6 +399,11 @@ impl<'a> AutonomousDiscoveryAgent<'a> {
                 return Ok(None);
             }
             *model_requests += 1;
+            (self.progress)(if attempt == 0 {
+                format!("{phase}: asking the model")
+            } else {
+                format!("{phase}: asking the model to repair its output")
+            });
             let response = (self.generate)(system.to_string(), format!("{prompt}{feedback}")).await?;
             match validate(&response) {
                 Ok(val) => return Ok(Some(val)),
@@ -722,6 +730,7 @@ pub struct HypothesisValidationAgent<'a> {
     pub generate: GenerateFn<'a>,
     pub search: SearchFn<'a>,
     pub retrieve: RetrieveFn<'a>,
+    pub progress: ProgressFn<'a>,
     pub access: InstitutionalAccess,
 }
 
@@ -851,6 +860,7 @@ impl<'a> HypothesisValidationAgent<'a> {
         let original_json = serde_json::to_string(&original).unwrap_or_default();
         let plan: ValidationPlan = self
             .structured(
+                "Validation planning",
                 &domain.instructions(VALIDATION_PLANNING_INSTRUCTIONS),
                 &format!("ORIGINAL HYPOTHESIS (untrusted JSON):\n{original_json}"),
                 Self::validate_plan,
@@ -1147,6 +1157,7 @@ impl<'a> HypothesisValidationAgent<'a> {
 
         let mut assessment: RawAssessment = self
             .structured(
+                "Evidence assessment",
                 &domain.instructions(VALIDATION_ASSESSMENT_INSTRUCTIONS),
                 &format!("UNTRUSTED RESEARCH PACKAGE (JSON):\n{input_json}{dataset_note}"),
                 |raw| Self::validate_assessment(raw, &plan, &documents),
@@ -1276,12 +1287,18 @@ impl<'a> HypothesisValidationAgent<'a> {
 
     async fn structured<T: DeserializeOwned>(
         &self,
+        label: &str,
         system: &str,
         prompt: &str,
         validate: impl Fn(T) -> Result<T, ResearchError>,
     ) -> Result<T, ResearchError> {
         let mut feedback = String::new();
         for attempt in 0..2 {
+            (self.progress)(if attempt == 0 {
+                format!("{label}: asking the model")
+            } else {
+                format!("{label}: asking the model to repair its output")
+            });
             let response = (self.generate)(system.to_string(), format!("{prompt}{feedback}")).await?;
             let decoded: Result<T, ResearchError> =
                 EvidenceValidator::decode_json(&response).and_then(&validate);
@@ -1504,6 +1521,7 @@ pub struct HypothesisConnectionAgent<'a> {
     pub generate: GenerateFn<'a>,
     pub search: SearchFn<'a>,
     pub retrieve: RetrieveFn<'a>,
+    pub progress: ProgressFn<'a>,
     pub access: InstitutionalAccess,
 }
 
@@ -1919,6 +1937,11 @@ impl<'a> HypothesisConnectionAgent<'a> {
                 ),
                 None => prompt.to_string(),
             };
+            (self.progress)(if attempt == 0 {
+                format!("{stage}: asking the model")
+            } else {
+                format!("{stage}: asking the model to repair its output")
+            });
             let response = (self.generate)(system.to_string(), full_prompt).await?;
             match decode(&response) {
                 Ok(val) => return Ok(val),

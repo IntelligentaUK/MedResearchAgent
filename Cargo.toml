@@ -42,6 +42,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 jsonwebtoken = { version = "9.3", default-features = false }
 base64 = "0.22"
+tokio-stream = { version = "0.1", features = ["sync"] }
 
 [dev-dependencies]
 tokio = { version = "1.43", features = ["rt-multi-thread", "macros", "test-util"] }

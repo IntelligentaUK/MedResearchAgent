@@ -6,6 +6,7 @@ pub mod chatgpt;
 pub mod citation;
 pub mod datasets;
 pub mod dedup;
+pub mod jobs;
 pub mod literature;
 pub mod model_catalog;
 pub mod models;

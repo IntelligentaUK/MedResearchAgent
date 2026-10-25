@@ -1,9 +1,11 @@
 use crate::agents::{
     AutonomousDiscoveryAgent, GenerateFn, HypothesisConnectionAgent, HypothesisValidationAgent,
+    ProgressFn, RetrieveFn, SearchFn,
 };
 use crate::chatgpt::{CallbackParams, ChatGptAuth, ChatGptStatus, CALLBACK_PATH, MANAGE_USAGE_URL};
 use crate::catalog::{JournalTier, ResearchSourceCatalog, WIDER_CORPUS_PAGE_SIZE};
 use crate::datasets::CancerDatasetClient;
+use crate::jobs::{JobRunner, JobSnapshot, JobStatus, JobUpdate, Progress};
 use crate::literature::{FreeFullTextClient, FreeLiteratureSearchClient};
 use crate::model_catalog::{ModelCatalog, ModelChoice, ProviderAccess};
 use crate::models::{
@@ -19,14 +21,18 @@ use axum::body::Body;
 use axum::extract::{DefaultBodyLimit, Form, Path, Query, State};
 use axum::http::{ header, HeaderMap, HeaderValue, Method, Request, StatusCode};
 use axum::middleware::{self, Next};
+use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
 use axum::Router;
 use chrono::Utc;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
+use std::convert::Infallible;
 use std::sync::Arc;
 use subtle::ConstantTimeEq;
+use tokio_stream::wrappers::BroadcastStream;
+use tokio_stream::StreamExt;
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
@@ -35,6 +41,7 @@ pub struct AppState {
     pub keychain: KeychainStore,
     pub chatgpt: ChatGptAuth,
     pub models: ModelCatalog,
+    pub jobs: Arc<JobRunner>,
     pub library: RwLock<LibrarySnapshot>,
     pub csrf_token: String,
     pub flash: RwLock<Option<String>>,
@@ -58,6 +65,7 @@ impl AppState {
             keychain,
             chatgpt: ChatGptAuth::new(&data_dir),
             models: ModelCatalog::new(&data_dir),
+            jobs: Arc::default(),
             library: RwLock::new(library),
             csrf_token,
             flash: RwLock::new(None),
@@ -86,6 +94,8 @@ pub fn build_router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/", get(index_handler))
         .route("/static/app.css", get(stylesheet_handler))
+        .route("/static/app.js", get(script_handler))
+        .route("/events", get(events_handler))
         .route("/domain", post(switch_domain_handler))
         .route("/objectives", post(objectives_handler))
         .route("/queue/manual", post(enqueue_manual_handler))
@@ -257,6 +267,7 @@ async fn index_handler(
         &chatgpt,
         state.keychain.backend(),
         &model_picker,
+        state.jobs.latest().as_ref(),
     ))
 }
 
@@ -792,120 +803,166 @@ async fn chatgpt_welcome_handler(
     Redirect::to(&format!("/?section={section}")).into_response()
 }
 
+/// Where to send the browser back to: the workspace section it came from (same-origin
+/// `Referer`), else `fallback`.
+fn back_to(headers: &HeaderMap, fallback: &str) -> String {
+    let section = headers
+        .get(header::REFERER)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|raw| url::Url::parse(raw).ok())
+        .filter(|u| u.path() == "/")
+        .and_then(|u| {
+            u.query_pairs()
+                .find(|(k, _)| k == "section")
+                .map(|(_, v)| v.into_owned())
+        })
+        .filter(|s| !s.is_empty() && s.chars().all(|c| c.is_ascii_lowercase()));
+    format!("/?section={}", section.as_deref().unwrap_or(fallback))
+}
+
+/// Literature search and full-text retrieval for an agent, reporting each step.
+fn literature_tools(
+    domain: ResearchDomain,
+    access: &InstitutionalAccess,
+    progress: &Progress,
+) -> (SearchFn<'static>, RetrieveFn<'static>) {
+    let (search_access, retrieve_access) = (access.clone(), access.clone());
+    let (search_progress, retrieve_progress) = (progress.clone(), progress.clone());
+    let search: SearchFn<'static> = Box::new(move |query| {
+        let acc = search_access.clone();
+        let progress = search_progress.clone();
+        Box::pin(async move {
+            progress.report(format!("Searching the literature: {query}"));
+            let result = FreeLiteratureSearchClient::default()
+                .search(&query, domain, &acc)
+                .await;
+            match &result {
+                Ok(found) => progress.report(format!("Found {} records", found.papers.len())),
+                Err(e) => progress.report(format!("Search failed: {e}")),
+            }
+            result
+        })
+    });
+    let retrieve: RetrieveFn<'static> = Box::new(move |paper| {
+        let acc = retrieve_access.clone();
+        let progress = retrieve_progress.clone();
+        Box::pin(async move {
+            let title: String = paper.title.chars().take(120).collect();
+            progress.report(format!("Reading full text: {title}"));
+            let result = FreeFullTextClient::default().full_text(&paper, &acc).await;
+            if let Err(e) = &result {
+                progress.report(format!("Full text unavailable: {e}"));
+            }
+            result
+        })
+    });
+    (search, retrieve)
+}
+
+fn progress_fn(progress: &Progress) -> ProgressFn<'static> {
+    let progress = progress.clone();
+    Box::new(move |message| progress.report(message))
+}
+
+/// Flashes why a stage could not start, or nothing when it did, and returns to the page.
+async fn after_start(
+    state: &AppState,
+    started: Result<u64, String>,
+    headers: &HeaderMap,
+    fallback: &str,
+) -> Response {
+    if let Err(e) = started {
+        state.set_flash(e).await;
+    }
+    Redirect::to(&back_to(headers, fallback)).into_response()
+}
+
 async fn run_discovery_handler(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Form(form): Form<RunAgentForm>,
 ) -> Response {
     if !verify_csrf(&state.csrf_token, &form.csrf_token) {
         return (StatusCode::FORBIDDEN, "Invalid CSRF token").into_response();
     }
-    let ModelSelection {
-        vendor,
-        model,
-        generate,
-    } = match select_model(&state, &form.vendor, form.model.as_deref()).await {
+    let selection = match select_model(&state, &form.vendor, form.model.as_deref()).await {
         Ok(selection) => selection,
         Err(e) => {
             state.set_flash(format!("Cannot start discovery: {e}")).await;
-            return Redirect::to("/?section=cycles").into_response();
+            return Redirect::to(&back_to(&headers, "loop")).into_response();
         }
     };
-
-    let (domain, prev_statements, objective) = {
-        let mut lib = state.library.write().await;
-        if let Err(e) = lib.pipeline.reserve_model_request(Utc::now()) {
-            state.set_flash(format!("Cannot start discovery: {e}")).await;
-            return Redirect::to("/?section=cycles").into_response();
-        }
-        let d = lib.pipeline.settings.domain();
-        let prev: Vec<String> = lib
-            .pipeline
-            .queue
-            .iter()
-            .filter(|q| q.domain() == d)
-            .map(|q| q.draft.statement.clone())
-            .collect();
-        let obj = form
-            .objective
-            .clone()
-            .filter(|s| !s.trim().is_empty())
-            .or_else(|| lib.pipeline.objectives(d).into_iter().next());
-        (d, prev, obj)
-    };
-
-    let access = state.keychain.institutional_access();
-    let access_search = access.clone();
-    let access_retrieve = access.clone();
-
-    let agent = AutonomousDiscoveryAgent {
-        generate,
-        search: Box::new(move |q| {
-            let acc = access_search.clone();
-            Box::pin(async move {
-                FreeLiteratureSearchClient::default()
-                    .search(&q, domain, &acc)
-                    .await
-            })
-        }),
-        retrieve: Box::new(move |paper| {
-            let acc = access_retrieve.clone();
-            Box::pin(async move { FreeFullTextClient::default().full_text(&paper, &acc).await })
-        }),
-        access,
-    };
-
-    match agent
-        .discover(
-            objective.as_deref(),
-            &prev_statements,
-            vendor.display_name(),
-            &model,
-            domain,
-            "",
-        )
-        .await
-    {
-        Ok(cycle) => {
-            let count = cycle.hypotheses.len();
-            let mut lib = state.library.write().await;
-            LibraryStore::complete_discovery(&mut lib, cycle, Vec::new());
-            let _ = state.store.save(&lib);
-            state
-                .set_flash(format!(
-                    "Discovery cycle completed: {count} grounded hypotheses added to the validation queue."
-                ))
-                .await;
-        }
-        Err(e) => {
-            state.set_flash(format!("Discovery cycle failed: {e}")).await;
-        }
-    }
-    Redirect::to("/?section=cycles").into_response()
+    let requested_objective = form.objective.clone().filter(|s| !s.trim().is_empty());
+    let app = Arc::clone(&state);
+    let title = format!("Discovery cycle · {}", selection.model);
+    let started = state.jobs.start(title, "cycles", move |progress| async move {
+        let ModelSelection {
+            vendor,
+            model,
+            generate,
+        } = selection;
+        let (domain, prev_statements, objective) = {
+            let mut lib = app.library.write().await;
+            lib.pipeline
+                .reserve_model_request(Utc::now())
+                .map_err(|e| format!("Cannot start discovery: {e}"))?;
+            let d = lib.pipeline.settings.domain();
+            let prev: Vec<String> = lib
+                .pipeline
+                .queue
+                .iter()
+                .filter(|q| q.domain() == d)
+                .map(|q| q.draft.statement.clone())
+                .collect();
+            let obj = requested_objective.or_else(|| lib.pipeline.objectives(d).into_iter().next());
+            (d, prev, obj)
+        };
+        progress.report(format!("Using {} · {model}", vendor.display_name()));
+        let access = app.keychain.institutional_access();
+        let (search, retrieve) = literature_tools(domain, &access, &progress);
+        let agent = AutonomousDiscoveryAgent {
+            generate,
+            search,
+            retrieve,
+            progress: progress_fn(&progress),
+            access,
+        };
+        let cycle = agent
+            .discover(
+                objective.as_deref(),
+                &prev_statements,
+                vendor.display_name(),
+                &model,
+                domain,
+                "",
+            )
+            .await
+            .map_err(|e| format!("Discovery cycle failed: {e}"))?;
+        let count = cycle.hypotheses.len();
+        let mut lib = app.library.write().await;
+        LibraryStore::complete_discovery(&mut lib, cycle, Vec::new());
+        app.store
+            .save(&lib)
+            .map_err(|e| format!("Discovery finished but could not be saved: {e}"))?;
+        Ok(format!(
+            "Discovery cycle completed: {count} grounded hypotheses added to the validation queue."
+        ))
+    });
+    after_start(&state, started, &headers, "loop").await
 }
 
 async fn run_validation_handler(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Form(form): Form<RunAgentForm>,
 ) -> Response {
     if !verify_csrf(&state.csrf_token, &form.csrf_token) {
         return (StatusCode::FORBIDDEN, "Invalid CSRF token").into_response();
     }
-    let ModelSelection {
-        vendor,
-        model,
-        generate,
-    } = match select_model(&state, &form.vendor, form.model.as_deref()).await {
-        Ok(selection) => selection,
-        Err(e) => {
-            state.set_flash(format!("Cannot start validation: {e}")).await;
-            return Redirect::to("/?section=queue").into_response();
-        }
-    };
-
-    let (target_item, supplied_papers, domain) = {
-        let mut lib = state.library.write().await;
+    let target_item = {
+        let lib = state.library.read().await;
         let d = lib.pipeline.settings.domain();
-        let item_opt = if let Some(ref raw_id) = form.hypothesis_id {
+        if let Some(ref raw_id) = form.hypothesis_id {
             Uuid::parse_str(raw_id)
                 .ok()
                 .and_then(|id| lib.pipeline.queue.iter().find(|q| q.id == id).cloned())
@@ -915,159 +972,175 @@ async fn run_validation_handler(
                 .iter()
                 .find(|q| q.domain() == d && q.validation_id.is_none())
                 .cloned()
-        };
-        let Some(item) = item_opt else {
-            state
-                .set_flash("No queued hypothesis found to validate.")
-                .await;
-            return Redirect::to("/?section=queue").into_response();
-        };
-        if let Err(e) = lib.pipeline.reserve_model_request(Utc::now()) {
-            state.set_flash(format!("Cannot start validation: {e}")).await;
-            return Redirect::to("/?section=queue").into_response();
         }
-        let papers = lib.research_papers(item.domain());
-        let item_domain = item.domain();
-        (item, papers, item_domain)
     };
-
-    let access = state.keychain.institutional_access();
-    let access_search = access.clone();
-    let access_retrieve = access.clone();
-
-    let agent = HypothesisValidationAgent {
-        generate,
-        search: Box::new(move |q| {
-            let acc = access_search.clone();
-            Box::pin(async move {
-                FreeLiteratureSearchClient::default()
-                    .search(&q, domain, &acc)
-                    .await
-            })
-        }),
-        retrieve: Box::new(move |paper| {
-            let acc = access_retrieve.clone();
-            Box::pin(async move { FreeFullTextClient::default().full_text(&paper, &acc).await })
-        }),
-        access,
+    let Some(target_item) = target_item else {
+        state
+            .set_flash("No queued hypothesis found to validate.")
+            .await;
+        return Redirect::to(&back_to(&headers, "queue")).into_response();
     };
-
-    match agent
-        .validate(
-            &target_item,
-            &supplied_papers,
-            vendor.display_name(),
-            &model,
-            domain,
-            "",
-        )
-        .await
-    {
-        Ok(validation) => {
-            let label = validation.verdict.label();
-            let mut lib = state.library.write().await;
-            LibraryStore::complete_validation(&mut lib, validation, Vec::new());
-            let _ = state.store.save(&lib);
-            state
-                .set_flash(format!("Validation completed: {label}."))
-                .await;
-        }
+    let selection = match select_model(&state, &form.vendor, form.model.as_deref()).await {
+        Ok(selection) => selection,
         Err(e) => {
-            state.set_flash(format!("Validation failed: {e}")).await;
+            state.set_flash(format!("Cannot start validation: {e}")).await;
+            return Redirect::to(&back_to(&headers, "queue")).into_response();
         }
-    }
-    Redirect::to("/?section=validations").into_response()
+    };
+    let app = Arc::clone(&state);
+    let title = format!(
+        "Validation · {}",
+        target_item.draft.title.chars().take(80).collect::<String>()
+    );
+    let started = state.jobs.start(title, "validations", move |progress| async move {
+        let ModelSelection {
+            vendor,
+            model,
+            generate,
+        } = selection;
+        let domain = target_item.domain();
+        let supplied_papers = {
+            let mut lib = app.library.write().await;
+            lib.pipeline
+                .reserve_model_request(Utc::now())
+                .map_err(|e| format!("Cannot start validation: {e}"))?;
+            lib.research_papers(domain)
+        };
+        progress.report(format!("Using {} · {model}", vendor.display_name()));
+        let access = app.keychain.institutional_access();
+        let (search, retrieve) = literature_tools(domain, &access, &progress);
+        let agent = HypothesisValidationAgent {
+            generate,
+            search,
+            retrieve,
+            progress: progress_fn(&progress),
+            access,
+        };
+        let validation = agent
+            .validate(
+                &target_item,
+                &supplied_papers,
+                vendor.display_name(),
+                &model,
+                domain,
+                "",
+            )
+            .await
+            .map_err(|e| format!("Validation failed: {e}"))?;
+        let label = validation.verdict.label();
+        let mut lib = app.library.write().await;
+        LibraryStore::complete_validation(&mut lib, validation, Vec::new());
+        app.store
+            .save(&lib)
+            .map_err(|e| format!("Validation finished but could not be saved: {e}"))?;
+        Ok(format!("Validation completed: {label}."))
+    });
+    after_start(&state, started, &headers, "queue").await
 }
 
 async fn run_connection_handler(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Form(form): Form<RunAgentForm>,
 ) -> Response {
     if !verify_csrf(&state.csrf_token, &form.csrf_token) {
         return (StatusCode::FORBIDDEN, "Invalid CSRF token").into_response();
     }
-    let ModelSelection {
-        vendor,
-        model,
-        generate,
-    } = match select_model(&state, &form.vendor, form.model.as_deref()).await {
+    let selection = match select_model(&state, &form.vendor, form.model.as_deref()).await {
         Ok(selection) => selection,
         Err(e) => {
-            state.set_flash(format!("Cannot start connection review: {e}")).await;
-            return Redirect::to("/?section=connections").into_response();
-        }
-    };
-
-    let (items, validations, papers, offset, domain) = {
-        let mut lib = state.library.write().await;
-        if let Err(e) = lib.pipeline.reserve_model_request(Utc::now()) {
             state
                 .set_flash(format!("Cannot start connection review: {e}"))
                 .await;
-            return Redirect::to("/?section=connections").into_response();
+            return Redirect::to(&back_to(&headers, "connections")).into_response();
         }
-        let d = lib.pipeline.settings.domain();
-        (
-            lib.pipeline.queue.clone(),
-            lib.pipeline.validations.clone(),
-            lib.research_papers(d),
-            lib.pipeline.connections.len(),
-            d,
-        )
     };
+    let app = Arc::clone(&state);
+    let title = format!("Connection review · {}", selection.model);
+    let started = state.jobs.start(title, "connections", move |progress| async move {
+        let ModelSelection {
+            vendor,
+            model,
+            generate,
+        } = selection;
+        let (items, validations, papers, offset, domain) = {
+            let mut lib = app.library.write().await;
+            lib.pipeline
+                .reserve_model_request(Utc::now())
+                .map_err(|e| format!("Cannot start connection review: {e}"))?;
+            let d = lib.pipeline.settings.domain();
+            (
+                lib.pipeline.queue.clone(),
+                lib.pipeline.validations.clone(),
+                lib.research_papers(d),
+                lib.pipeline.connections.len(),
+                d,
+            )
+        };
+        progress.report(format!("Using {} · {model}", vendor.display_name()));
+        let access = app.keychain.institutional_access();
+        let (search, retrieve) = literature_tools(domain, &access, &progress);
+        let agent = HypothesisConnectionAgent {
+            generate,
+            search,
+            retrieve,
+            progress: progress_fn(&progress),
+            access,
+        };
+        let review = agent
+            .connect(
+                &items,
+                &validations,
+                &papers,
+                vendor.display_name(),
+                &model,
+                offset,
+                domain,
+                "",
+            )
+            .await
+            .map_err(|e| format!("Connection review failed: {e}"))?;
+        let count = review.proposals.len();
+        let mut lib = app.library.write().await;
+        LibraryStore::complete_connection(&mut lib, review, Vec::new());
+        app.store
+            .save(&lib)
+            .map_err(|e| format!("Connection review finished but could not be saved: {e}"))?;
+        Ok(format!(
+            "Connection review completed: {count} proposals queued."
+        ))
+    });
+    after_start(&state, started, &headers, "connections").await
+}
 
-    let access = state.keychain.institutional_access();
-    let access_search = access.clone();
-    let access_retrieve = access.clone();
+/// Server-sent events for the activity panel: the latest job's state on connect, then
+/// every change. The connection stays open while the page does.
+async fn events_handler(
+    State(state): State<Arc<AppState>>,
+) -> Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>> {
+    // Subscribe before reading the snapshot so no update falls between the two.
+    let updates = BroadcastStream::new(state.jobs.subscribe()).filter_map(|update| {
+        let update = update.ok()?;
+        let kind = match &update {
+            JobUpdate::Started { .. } => "started",
+            JobUpdate::Progress { .. } => "progress",
+            JobUpdate::Finished { .. } => "finished",
+        };
+        Event::default().event(kind).json_data(&update).ok().map(Ok)
+    });
+    let snapshot = Event::default()
+        .event("snapshot")
+        .json_data(state.jobs.latest())
+        .unwrap_or_else(|_| Event::default().event("snapshot").data("null"));
+    Sse::new(tokio_stream::once(Ok(snapshot)).chain(updates)).keep_alive(KeepAlive::default())
+}
 
-    let agent = HypothesisConnectionAgent {
-        generate,
-        search: Box::new(move |q| {
-            let acc = access_search.clone();
-            Box::pin(async move {
-                FreeLiteratureSearchClient::default()
-                    .search(&q, domain, &acc)
-                    .await
-            })
-        }),
-        retrieve: Box::new(move |paper| {
-            let acc = access_retrieve.clone();
-            Box::pin(async move { FreeFullTextClient::default().full_text(&paper, &acc).await })
-        }),
-        access,
-    };
-
-    match agent
-        .connect(
-            &items,
-            &validations,
-            &papers,
-            vendor.display_name(),
-            &model,
-            offset,
-            domain,
-            "",
-        )
-        .await
-    {
-        Ok(review) => {
-            let count = review.proposals.len();
-            let mut lib = state.library.write().await;
-            LibraryStore::complete_connection(&mut lib, review, Vec::new());
-            let _ = state.store.save(&lib);
-            state
-                .set_flash(format!(
-                    "Connection review completed: {count} proposals queued."
-                ))
-                .await;
-        }
-        Err(e) => {
-            state
-                .set_flash(format!("Connection review failed: {e}"))
-                .await;
-        }
-    }
-    Redirect::to("/?section=connections").into_response()
+async fn script_handler() -> Response {
+    (
+        [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
+        WORKSPACE_JS,
+    )
+        .into_response()
 }
 
 #[derive(Deserialize)]
@@ -1248,6 +1321,7 @@ fn render_workspace(
     chatgpt: &ChatGptStatus,
     secret_store: &SecretBackend,
     model_picker: &str,
+    job: Option<&JobSnapshot>,
 ) -> String {
     let domain = lib.pipeline.settings.domain();
     let domain_papers = lib.research_papers(domain);
@@ -1344,6 +1418,9 @@ fn render_workspace(
         String::new()
     };
 
+    let job_panel = render_job_panel(job);
+    let job_running = job.is_some_and(|j| j.status == JobStatus::Running);
+
     let csrf_escaped = html_escape(csrf_token);
     let dementia_selected = if domain == ResearchDomain::Dementia {
         " selected"
@@ -1364,8 +1441,9 @@ fn render_workspace(
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{} Medical Research Agent — Hardened Rust/Axum SSR</title>
   <link rel="stylesheet" href="/static/app.css">
+  <script src="/static/app.js" defer></script>
 </head>
-<body>
+<body data-job-running="{job_running}">
   <div class="layout">
     <aside class="sidebar">
       <div class="brand">
@@ -1397,6 +1475,7 @@ fn render_workspace(
       </div>
     </aside>
     <main class="content">
+      {job_panel}
       {welcome_html}
       {flash_html}
       {main_content}
@@ -1406,6 +1485,57 @@ fn render_workspace(
 </html>"#,
         html_escape(domain.display_name()),
         html_escape(section)
+    )
+}
+
+/// The activity panel for the latest research stage. `static/app.js` keeps it live; this
+/// server-rendered copy is what a page shows on load (and without JavaScript).
+fn render_job_panel(job: Option<&JobSnapshot>) -> String {
+    let Some(job) = job else {
+        return r#"<section id="job-panel" class="card job-panel" hidden></section>"#.to_string();
+    };
+    let (status, pill, label) = match job.status {
+        JobStatus::Running => ("running", "pill-warn", "Running"),
+        JobStatus::Succeeded => ("succeeded", "pill-ok", "Completed"),
+        JobStatus::Failed => ("failed", "pill-error", "Failed"),
+    };
+    let lines: String = job
+        .log
+        .iter()
+        .map(|line| {
+            format!(
+                r#"<li><time datetime="{}">{}</time> {}</li>"#,
+                html_escape(&line.at.to_rfc3339()),
+                line.at.format("%H:%M:%S UTC"),
+                html_escape(&line.message)
+            )
+        })
+        .collect();
+    let outcome = job
+        .outcome
+        .as_deref()
+        .map(|o| {
+            let class = if job.status == JobStatus::Failed { "job-outcome job-failed" } else { "job-outcome" };
+            format!(r#"<p class="{class}">{}</p>"#, html_escape(o))
+        })
+        .unwrap_or_default();
+    let results = if job.status == JobStatus::Running {
+        String::new()
+    } else {
+        format!(
+            r#"<a class="btn-link" href="/?section={}">View results</a>"#,
+            html_escape(&job.section)
+        )
+    };
+    format!(
+        r#"<section id="job-panel" class="card job-panel" data-job-id="{}" data-status="{status}">
+        <div class="row-between"><h3>{}</h3><span class="pill {pill}">{label}</span></div>
+        {outcome}
+        <ol class="job-log">{lines}</ol>
+        {results}
+      </section>"#,
+        job.id,
+        html_escape(&job.title)
     )
 }
 
@@ -2120,4 +2250,127 @@ blockquote {
   border-left: 3px solid var(--accent);
   color: var(--text);
 }
+.pill-error { background: rgba(239, 68, 68, 0.2); color: #fca5a5; }
+.content a:not(.btn-link) { color: #93c5fd; }
+.job-panel { border-color: var(--accent); }
+.job-panel h3 { margin: 0; }
+.job-outcome { margin: 0.5rem 0 0; }
+.job-failed { color: #fca5a5; }
+.job-log {
+  list-style: none;
+  margin: 0.75rem 0 0.5rem;
+  padding: 0;
+  max-height: 16rem;
+  overflow-y: auto;
+  font-size: 0.85rem;
+}
+.job-log li { padding: 0.2rem 0; border-bottom: 1px solid var(--border); overflow-wrap: anywhere; }
+.job-log time { color: var(--muted); font-variant-numeric: tabular-nums; margin-right: 0.5rem; }
+/* One stage runs at a time; the server also refuses a second one. */
+body[data-job-running="true"] form[action^="/loop/"] button { opacity: 0.5; pointer-events: none; }
 "#;
+
+/// Keeps the activity panel live over server-sent events and, when a stage finishes,
+/// reloads the page content in place. Builds every element with `textContent`; no
+/// server or model text is ever parsed as HTML except the app's own escaped pages.
+const WORKSPACE_JS: &str = r##""use strict";
+(() => {
+  if (!("EventSource" in window)) return;
+  const LABELS = { running: "Running", succeeded: "Completed", failed: "Failed" };
+  const PILLS = { running: "pill-warn", succeeded: "pill-ok", failed: "pill-error" };
+  let job = null;
+
+  const el = (tag, className, text) => {
+    const node = document.createElement(tag);
+    if (className) node.className = className;
+    if (text !== undefined) node.textContent = text;
+    return node;
+  };
+  const logLine = (line) => {
+    const item = el("li");
+    const time = el("time", null, new Date(line.at).toLocaleTimeString());
+    time.dateTime = line.at;
+    item.append(time, " ", line.message);
+    return item;
+  };
+
+  function render() {
+    document.body.dataset.jobRunning = String(job !== null && job.status === "running");
+    const panel = document.getElementById("job-panel");
+    if (!panel) return;
+    if (!job) {
+      panel.hidden = true;
+      return;
+    }
+    panel.hidden = false;
+    panel.dataset.jobId = String(job.id);
+    panel.dataset.status = job.status;
+    const head = el("div", "row-between");
+    head.append(el("h3", null, job.title), el("span", "pill " + PILLS[job.status], LABELS[job.status]));
+    const parts = [head];
+    if (job.outcome) {
+      parts.push(el("p", job.status === "failed" ? "job-outcome job-failed" : "job-outcome", job.outcome));
+    }
+    const log = el("ol", "job-log");
+    job.log.forEach((line) => log.append(logLine(line)));
+    parts.push(log);
+    if (job.status !== "running") {
+      const link = el("a", "btn-link", "View results");
+      link.href = "/?section=" + encodeURIComponent(job.section);
+      parts.push(link);
+    }
+    panel.replaceChildren(...parts);
+    log.scrollTop = log.scrollHeight;
+  }
+
+  function appendLine(update) {
+    if (!job || job.id !== update.id) return;
+    job.log.push(update.line);
+    const log = document.querySelector("#job-panel .job-log");
+    if (!log) return render();
+    const atBottom = log.scrollHeight - log.scrollTop - log.clientHeight < 40;
+    log.append(logLine(update.line));
+    if (atBottom) log.scrollTop = log.scrollHeight;
+  }
+
+  // Swap in the updated page content (new results, counts) without a full reload, unless
+  // the user is typing in a field.
+  async function refreshContent() {
+    const active = document.activeElement;
+    if (active && active.matches("input, textarea, select") && active.closest("main")) return;
+    try {
+      const response = await fetch(location.href, { headers: { Accept: "text/html" }, cache: "no-store" });
+      if (!response.ok) return;
+      const page = new DOMParser().parseFromString(await response.text(), "text/html");
+      for (const selector of ["main.content", "aside.sidebar nav"]) {
+        const fresh = page.querySelector(selector);
+        const current = document.querySelector(selector);
+        if (fresh && current) current.replaceWith(document.adoptNode(fresh));
+      }
+      render();
+    } catch (_) {
+      // Keep the current page; the "View results" link still works.
+    }
+  }
+
+  const source = new EventSource("/events");
+  const read = (event) => JSON.parse(event.data);
+  source.addEventListener("snapshot", (event) => {
+    const wasRunning = job !== null && job.status === "running";
+    job = read(event);
+    render();
+    // Reconnected after the stage finished while the connection was down.
+    if (wasRunning && job && job.status !== "running") refreshContent();
+  });
+  source.addEventListener("started", (event) => {
+    job = read(event).job;
+    render();
+  });
+  source.addEventListener("progress", (event) => appendLine(read(event)));
+  source.addEventListener("finished", (event) => {
+    job = read(event).job;
+    render();
+    refreshContent();
+  });
+})();
+"##;

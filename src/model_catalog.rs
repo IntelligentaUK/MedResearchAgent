@@ -14,6 +14,7 @@ use crate::store::write_private_file;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 
@@ -81,10 +82,9 @@ pub struct ProviderAccess<'a> {
 impl ProviderAccess<'_> {
     /// Whether the provider is set up (no network call).
     pub async fn ready(&self, vendor: ModelVendor) -> bool {
-        match vendor {
-            ModelVendor::ChatGpt => self.chatgpt.status().await.plan_usage,
-            ModelVendor::Anthropic => self.keychain.get("anthropic_api_key").is_some(),
-            ModelVendor::OpenAi => self.keychain.get("openai_api_key").is_some(),
+        match vendor.api_key_account() {
+            Some(account) => self.keychain.get(account).is_some(),
+            None => self.chatgpt.status().await.plan_usage,
         }
     }
 
@@ -110,6 +110,8 @@ pub struct ModelCatalog {
     preferences_path: PathBuf,
     preferred: RwLock<Option<ModelChoice>>,
     cache: RwLock<HashMap<ModelVendor, CachedList>>,
+    /// Messages for the next page view, e.g. that a rejected key was removed.
+    notices: Mutex<Vec<String>>,
 }
 
 impl ModelCatalog {
@@ -125,7 +127,45 @@ impl ModelCatalog {
             preferences_path,
             preferred: RwLock::new(preferred),
             cache: RwLock::default(),
+            notices: Mutex::default(),
         }
+    }
+
+    /// Messages to show on the next page view, oldest first.
+    pub fn take_notices(&self) -> Vec<String> {
+        self.notices
+            .lock()
+            .map(|mut notices| std::mem::take(&mut *notices))
+            .unwrap_or_default()
+    }
+
+    /// Deletes a provider's saved API key after the provider rejected it (HTTP 401), but
+    /// only while the saved key is still the one that was rejected, so a key saved in the
+    /// meantime is kept. Returns the message to show.
+    pub async fn forget_rejected_key(
+        &self,
+        keychain: &KeychainStore,
+        vendor: ModelVendor,
+        rejected_key: &str,
+    ) -> String {
+        let name = vendor.display_name();
+        let Some(account) = vendor.api_key_account() else {
+            return format!("{name} rejected the credentials.");
+        };
+        if keychain.get(account).as_deref() != Some(rejected_key.trim()) {
+            return format!("{name} rejected an API key that has since been replaced.");
+        }
+        let message = match keychain.delete(account) {
+            Ok(()) => format!(
+                "{name} rejected the saved API key as invalid, so it was removed. Add a valid key in Sources & credentials."
+            ),
+            Err(e) => format!("{name} rejected the saved API key as invalid, but it could not be removed: {e}"),
+        };
+        self.invalidate(&[vendor]).await;
+        if let Ok(mut notices) = self.notices.lock() {
+            notices.push(message.clone());
+        }
+        message
     }
 
     pub async fn preferred(&self) -> Option<ModelChoice> {
@@ -170,9 +210,16 @@ impl ModelCatalog {
                 return Some(cached.result.clone());
             }
         }
+        let key_used = vendor
+            .api_key_account()
+            .and_then(|account| access.keychain.get(account));
         let result = match tokio::time::timeout(LIST_TIMEOUT, access.list(vendor)).await {
             Ok(Ok(list)) if list.is_empty() => Err("no models are available".to_string()),
             Ok(Ok(list)) => Ok(list),
+            Ok(Err(ResearchError::Http(401, _))) if key_used.is_some() => {
+                let key = key_used.unwrap_or_default();
+                return Some(Err(self.forget_rejected_key(access.keychain, vendor, &key).await));
+            }
             Ok(Err(e)) => Err(e.to_string()),
             Err(_) => Err("the provider did not respond in time".to_string()),
         };

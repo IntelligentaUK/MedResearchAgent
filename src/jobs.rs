@@ -1,12 +1,14 @@
 //! Background research stages with live progress.
 //!
 //! Model stages take minutes, so they run as background jobs instead of holding the HTTP
-//! request open. One job runs at a time (they share the daily model budget and the
-//! library). Progress is kept in memory for the latest job and broadcast to every open
-//! page; the job keeps running if the browser is closed.
+//! request open. Each research field runs one job at a time, so Dementia and Cancer work
+//! can proceed side by side. Progress is kept in memory for each field's latest job and
+//! broadcast to every open page; a job keeps running if the browser is closed.
 
+use crate::models::ResearchDomain;
 use chrono::{DateTime, Utc};
 use serde::Serialize;
+use std::collections::HashMap;
 use std::future::Future;
 use std::sync::{Arc, Mutex};
 use tokio::sync::broadcast;
@@ -32,6 +34,10 @@ pub struct LogLine {
 #[derive(Debug, Clone, Serialize)]
 pub struct JobSnapshot {
     pub id: u64,
+    /// The research field the job belongs to.
+    pub domain: ResearchDomain,
+    /// The field's display name, for pages showing another field's job.
+    pub field: String,
     pub title: String,
     /// The workspace section where the job's results appear.
     pub section: String,
@@ -47,12 +53,22 @@ pub struct JobSnapshot {
 #[serde(tag = "kind", rename_all = "lowercase")]
 pub enum JobUpdate {
     Started { job: JobSnapshot },
-    Progress { id: u64, line: LogLine },
+    Progress {
+        id: u64,
+        domain: ResearchDomain,
+        line: LogLine,
+    },
     Finished { job: JobSnapshot },
 }
 
+#[derive(Default)]
+struct Jobs {
+    next_id: u64,
+    latest: HashMap<ResearchDomain, JobSnapshot>,
+}
+
 pub struct JobRunner {
-    latest: Mutex<Option<JobSnapshot>>,
+    jobs: Mutex<Jobs>,
     updates: broadcast::Sender<JobUpdate>,
 }
 
@@ -60,7 +76,7 @@ impl Default for JobRunner {
     fn default() -> Self {
         let (updates, _) = broadcast::channel(256);
         Self {
-            latest: Mutex::new(None),
+            jobs: Mutex::default(),
             updates,
         }
     }
@@ -71,6 +87,7 @@ impl Default for JobRunner {
 pub struct Progress {
     runner: Arc<JobRunner>,
     id: u64,
+    domain: ResearchDomain,
 }
 
 impl Progress {
@@ -79,8 +96,8 @@ impl Progress {
             at: Utc::now(),
             message: message.into(),
         };
-        if let Ok(mut latest) = self.runner.latest.lock() {
-            match latest.as_mut() {
+        if let Ok(mut jobs) = self.runner.jobs.lock() {
+            match jobs.latest.get_mut(&self.domain) {
                 Some(job) if job.id == self.id => {
                     if job.log.len() >= MAX_LOG_LINES {
                         job.log.remove(0);
@@ -90,17 +107,36 @@ impl Progress {
                 _ => return,
             }
         }
-        let _ = self.runner.updates.send(JobUpdate::Progress { id: self.id, line });
+        let _ = self.runner.updates.send(JobUpdate::Progress {
+            id: self.id,
+            domain: self.domain,
+            line,
+        });
     }
 }
 
 impl JobRunner {
-    pub fn latest(&self) -> Option<JobSnapshot> {
-        self.latest.lock().ok().and_then(|latest| latest.clone())
+    /// The field's latest job.
+    pub fn latest(&self, domain: ResearchDomain) -> Option<JobSnapshot> {
+        self.jobs
+            .lock()
+            .ok()
+            .and_then(|jobs| jobs.latest.get(&domain).cloned())
     }
 
-    pub fn is_running(&self) -> bool {
-        self.latest()
+    /// Every field's latest job, oldest first.
+    pub fn all_latest(&self) -> Vec<JobSnapshot> {
+        let mut all: Vec<JobSnapshot> = self
+            .jobs
+            .lock()
+            .map(|jobs| jobs.latest.values().cloned().collect())
+            .unwrap_or_default();
+        all.sort_by_key(|job| job.id);
+        all
+    }
+
+    pub fn is_running(&self, domain: ResearchDomain) -> bool {
+        self.latest(domain)
             .is_some_and(|job| job.status == JobStatus::Running)
     }
 
@@ -108,10 +144,11 @@ impl JobRunner {
         self.updates.subscribe()
     }
 
-    /// Starts `work` in the background unless a job is already running. `work` returns
-    /// the outcome message to show, or an error message.
+    /// Starts `work` in the background unless the field already has a job running.
+    /// `work` returns the outcome message to show, or an error message.
     pub fn start<F, Fut>(
         self: &Arc<Self>,
+        domain: ResearchDomain,
         title: impl Into<String>,
         section: &str,
         work: F,
@@ -121,21 +158,26 @@ impl JobRunner {
         Fut: Future<Output = Result<String, String>> + Send + 'static,
     {
         let job = {
-            let mut latest = self
-                .latest
+            let mut jobs = self
+                .jobs
                 .lock()
                 .map_err(|_| "The job runner is unavailable.".to_string())?;
-            if let Some(running) = latest
-                .as_ref()
+            if let Some(running) = jobs
+                .latest
+                .get(&domain)
                 .filter(|job| job.status == JobStatus::Running)
             {
                 return Err(format!(
-                    "{} is still running. Wait for it to finish.",
+                    "{} research is still running {}. Wait for it to finish.",
+                    domain.display_name(),
                     running.title
                 ));
             }
+            jobs.next_id += 1;
             let job = JobSnapshot {
-                id: latest.as_ref().map_or(1, |job| job.id + 1),
+                id: jobs.next_id,
+                domain,
+                field: domain.display_name().to_string(),
                 title: title.into(),
                 section: section.to_string(),
                 status: JobStatus::Running,
@@ -144,7 +186,7 @@ impl JobRunner {
                 outcome: None,
                 log: Vec::new(),
             };
-            *latest = Some(job.clone());
+            jobs.latest.insert(domain, job.clone());
             job
         };
         let id = job.id;
@@ -153,6 +195,7 @@ impl JobRunner {
         let task = tokio::spawn(work(Progress {
             runner: Arc::clone(self),
             id,
+            domain,
         }));
         let runner = Arc::clone(self);
         tokio::spawn(async move {
@@ -160,17 +203,17 @@ impl JobRunner {
             let result = task
                 .await
                 .unwrap_or_else(|_| Err("The stage stopped unexpectedly.".to_string()));
-            runner.finish(id, result);
+            runner.finish(domain, id, result);
         });
         Ok(id)
     }
 
-    fn finish(&self, id: u64, result: Result<String, String>) {
+    fn finish(&self, domain: ResearchDomain, id: u64, result: Result<String, String>) {
         let finished = {
-            let Ok(mut latest) = self.latest.lock() else {
+            let Ok(mut jobs) = self.jobs.lock() else {
                 return;
             };
-            let Some(job) = latest.as_mut().filter(|job| job.id == id) else {
+            let Some(job) = jobs.latest.get_mut(&domain).filter(|job| job.id == id) else {
                 return;
             };
             job.finished_at = Some(Utc::now());
@@ -197,32 +240,50 @@ mod tests {
         let mut updates = runner.subscribe();
         let (release, wait) = tokio::sync::oneshot::channel::<()>();
         runner
-            .start("First stage", "cycles", |progress| async move {
+            .start(ResearchDomain::Dementia, "First stage", "cycles", |progress| async move {
                 progress.report("step one");
                 let _ = wait.await;
                 Ok("done".to_string())
             })
             .expect("start");
-        assert!(runner.is_running());
+        assert!(runner.is_running(ResearchDomain::Dementia));
         assert!(runner
-            .start("Second stage", "queue", |_| async { Ok(String::new()) })
+            .start(ResearchDomain::Dementia, "Second stage", "queue", |_| async {
+                Ok(String::new())
+            })
             .is_err());
+        // The other field is not blocked.
+        assert!(!runner.is_running(ResearchDomain::Cancer));
+        runner
+            .start(ResearchDomain::Cancer, "Cancer stage", "cycles", |_| async {
+                Ok("cancer done".to_string())
+            })
+            .expect("cancer starts alongside dementia");
 
-        assert!(matches!(updates.recv().await, Ok(JobUpdate::Started { .. })));
-        match updates.recv().await {
-            Ok(JobUpdate::Progress { line, .. }) => assert_eq!(line.message, "step one"),
-            other => panic!("expected progress, got {other:?}"),
-        }
         let _ = release.send(());
-        match tokio::time::timeout(Duration::from_secs(5), updates.recv()).await {
-            Ok(Ok(JobUpdate::Finished { job })) => {
-                assert_eq!(job.status, JobStatus::Succeeded);
-                assert_eq!(job.outcome.as_deref(), Some("done"));
-                assert_eq!(job.log.len(), 1);
+        let mut finished = Vec::new();
+        let mut progress_lines = Vec::new();
+        while finished.len() < 2 {
+            match tokio::time::timeout(Duration::from_secs(5), updates.recv()).await {
+                Ok(Ok(JobUpdate::Progress { line, domain, .. })) => {
+                    assert_eq!(domain, ResearchDomain::Dementia);
+                    progress_lines.push(line.message);
+                }
+                Ok(Ok(JobUpdate::Finished { job })) => finished.push(job),
+                Ok(Ok(JobUpdate::Started { .. })) => {}
+                other => panic!("unexpected update {other:?}"),
             }
-            other => panic!("expected finish, got {other:?}"),
         }
-        assert!(!runner.is_running());
+        assert_eq!(progress_lines, ["step one"]);
+        let dementia = finished
+            .iter()
+            .find(|j| j.domain == ResearchDomain::Dementia)
+            .expect("dementia finished");
+        assert_eq!(dementia.status, JobStatus::Succeeded);
+        assert_eq!(dementia.outcome.as_deref(), Some("done"));
+        assert_eq!(dementia.log.len(), 1);
+        assert!(!runner.is_running(ResearchDomain::Dementia));
+        assert_eq!(runner.all_latest().len(), 2);
     }
 
     #[tokio::test]
@@ -230,7 +291,7 @@ mod tests {
         let runner = Arc::new(JobRunner::default());
         let mut updates = runner.subscribe();
         runner
-            .start("Crashing stage", "cycles", |_| async {
+            .start(ResearchDomain::Cancer, "Crashing stage", "cycles", |_| async {
                 if true {
                     panic!("boom");
                 }
@@ -247,6 +308,6 @@ mod tests {
                 other => panic!("expected finish, got {other:?}"),
             }
         }
-        assert!(!runner.is_running());
+        assert!(!runner.is_running(ResearchDomain::Cancer));
     }
 }

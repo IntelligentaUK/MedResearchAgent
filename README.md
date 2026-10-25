@@ -96,6 +96,8 @@ The first build downloads and compiles all dependencies and takes a few minutes.
   | Linux desktop | Secret Service: GNOME Keyring, KWallet or KeePassXC |
   | No secret store (servers, containers, WSL) | Owner-only `secrets.json` in the data directory, with a warning |
 
+  Credentials are checked before they are saved: Claude API keys must start with `sk-ant-api` (Claude sign-in and Admin tokens are refused), OpenAI keys with `sk-` (admin keys are refused), Elsevier and Wiley tokens must have the expected characters, and the library proxy must be an `https://` address. When Anthropic or OpenAI rejects a saved key as invalid (HTTP 401), while listing models or during a run, the app removes it and says so on the next page.
+
   The store is chosen when the app starts, so after installing or unlocking a keyring, restart the app to use it. Keys are never moved between stores automatically.
 
 ### Sign in with ChatGPT
@@ -109,7 +111,7 @@ The first build downloads and compiles all dependencies and takes a few minutes.
 
 ### Live progress
 
-Discovery cycles, validations and connection reviews run in the background, one at a time. After you start one, an **activity panel** at the top of every page shows each step as it happens (model requests by phase, literature searches, full-text reads), streamed from `/events` (server-sent events). When the stage finishes, the panel shows the outcome and the page content updates in place with the new results; no manual refresh is needed. A stage keeps running if you close the page, and the panel shows its latest state when you return. Run buttons are disabled while a stage is running.
+Discovery cycles, validations and connection reviews run in the background, one at a time per research field, so Dementia and Cancer stages can run side by side. After you start one, an **activity panel** at the top of every page shows each step as it happens (model requests by phase, literature searches, full-text reads), streamed from `/events` (server-sent events). When the stage finishes, the panel shows the outcome and the page content updates in place with the new results; no manual refresh is needed. Each field's page shows that field's stage, with a note when the other field has one running. A stage keeps running if you close the page, and the panel shows its latest state when you return. A field's run buttons are disabled while its stage is running.
 
 ### Choosing a model
 

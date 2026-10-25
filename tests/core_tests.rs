@@ -506,3 +506,106 @@ async fn loop_page_offers_automatic_model_and_explains_missing_providers() {
     assert!(!html.contains("<optgroup"));
     let _ = std::fs::remove_dir_all(dir);
 }
+
+#[test]
+fn credential_formats_are_checked_before_saving() {
+    use dementia_research_web::providers::check_credential_format as check;
+
+    let claude = format!("sk-ant-api03-{}", "A".repeat(40));
+    assert!(check("anthropic_api_key", &claude).is_ok());
+    for bad in ["sk-ant-oat01-abcdefghijklmnopqrstuvwxyz0123456789", "sk-ant-admin01-abcdefghijklmnopqrstuvwxyz0123456789", "sk-proj-abc", "hello", "sk-ant-api03-short"] {
+        assert!(check("anthropic_api_key", bad).is_err(), "{bad} accepted");
+    }
+    let err = check("anthropic_api_key", "sk-ant-oat01-abcdefghijklmnopqrstuvwxyz0123456789").unwrap_err();
+    assert!(err.contains("sign-in token") && !err.contains("abcdefgh"), "message must not echo the value");
+
+    let openai = format!("sk-proj-{}", "b".repeat(48));
+    assert!(check("openai_api_key", &openai).is_ok());
+    assert!(check("openai_api_key", &format!("sk-admin-{}", "c".repeat(40))).is_err());
+    assert!(check("openai_api_key", &claude.replace("sk-", "pk-")).is_err());
+
+    assert!(check("elsevier_api_key", "0123456789abcdef0123456789abcdef").is_ok());
+    assert!(check("elsevier_api_key", "not a key!").is_err());
+    assert!(check("wiley_tdm_token", "123e4567-e89b-12d3-a456-426614174000").is_ok());
+    assert!(check("wiley_tdm_token", "not-a-token").is_err());
+    assert!(check("library_proxy_prefix", "https://ezproxy.example.edu/login?url=").is_ok());
+    assert!(check("library_proxy_prefix", "http://ezproxy.example.edu/login?url=").is_err());
+    assert!(check("library_proxy_prefix", "https://user:pw@ezproxy.example.edu/").is_err());
+}
+
+#[tokio::test]
+async fn rejected_keys_are_removed_unless_already_replaced() {
+    use dementia_research_web::model_catalog::ModelCatalog;
+    use dementia_research_web::providers::{KeychainStore, ModelVendor};
+
+    let dir = std::env::temp_dir().join(format!("dra-test-{}", uuid::Uuid::new_v4()));
+    let keychain = KeychainStore::in_memory();
+    let catalog = ModelCatalog::new(&dir);
+
+    keychain.set("anthropic_api_key", "sk-ant-api03-old").expect("save");
+    let message = catalog
+        .forget_rejected_key(&keychain, ModelVendor::Anthropic, "sk-ant-api03-old")
+        .await;
+    assert!(message.contains("was removed"));
+    assert_eq!(keychain.get("anthropic_api_key"), None);
+    assert_eq!(catalog.take_notices(), vec![message]);
+    assert!(catalog.take_notices().is_empty());
+
+    // A key saved after the rejected request was sent is kept.
+    keychain.set("openai_api_key", "sk-proj-new").expect("save");
+    catalog
+        .forget_rejected_key(&keychain, ModelVendor::OpenAi, "sk-proj-old")
+        .await;
+    assert_eq!(keychain.get("openai_api_key").as_deref(), Some("sk-proj-new"));
+    assert!(catalog.take_notices().is_empty());
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn credentials_form_saves_valid_keys_and_explains_rejected_ones() {
+    use axum::body::Body;
+    use axum::http::{Method, Request, StatusCode};
+    use dementia_research_web::providers::KeychainStore;
+    use dementia_research_web::store::LibraryStore;
+    use dementia_research_web::web::{build_router, AppState};
+    use http_body_util::BodyExt;
+    use tower::ServiceExt;
+
+    let dir = std::env::temp_dir().join(format!("dra-test-{}", uuid::Uuid::new_v4()));
+    let keychain = KeychainStore::in_memory();
+    let state = AppState::new(LibraryStore::new(dir.join("library.json")), keychain.clone())
+        .expect("state");
+    let csrf = state.csrf_token.clone();
+    let app = build_router(state);
+
+    let openai = format!("sk-proj-{}", "b".repeat(48));
+    let body = format!(
+        "csrf_token={csrf}&anthropic_api_key=sk-ant-oat01-notanapikeyatallnotanapikeyatall&openai_api_key={openai}"
+    );
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/credentials")
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .body(Body::from(body))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    assert_eq!(keychain.get("anthropic_api_key"), None);
+    assert_eq!(keychain.get("openai_api_key").as_deref(), Some(openai.as_str()));
+
+    let page = app
+        .oneshot(Request::get("/?section=sources").body(Body::empty()).expect("request"))
+        .await
+        .expect("response");
+    let html = String::from_utf8(page.into_body().collect().await.expect("body").to_bytes().to_vec())
+        .expect("utf8");
+    assert!(html.contains("Claude API key not saved: That is a Claude sign-in token"));
+    assert!(html.contains("Credentials saved to memory."));
+    assert!(!html.contains("notanapikey"), "the rejected value must not be echoed");
+    let _ = std::fs::remove_dir_all(dir);
+}

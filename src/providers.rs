@@ -328,6 +328,63 @@ fn write_secrets_file(path: &Path, secrets: &HashMap<String, String>) -> Result<
     write_private_file(path, &payload)
 }
 
+/// Checks that a credential looks like what its field expects, before it is saved.
+/// Messages never include the value.
+pub fn check_credential_format(account: &str, value: &str) -> Result<(), String> {
+    let value = value.trim();
+    let token_chars = |s: &str| s.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+    match account {
+        "anthropic_api_key" => {
+            if value.starts_with("sk-ant-oat") || value.starts_with("sk-ant-ort") {
+                Err("That is a Claude sign-in token, not an API key. Create an API key in the Claude Console; it starts with sk-ant-api.".to_string())
+            } else if value.starts_with("sk-ant-admin") {
+                Err("That is an Anthropic Admin API key, which cannot run models. Use a standard API key; it starts with sk-ant-api.".to_string())
+            } else if value.starts_with("sk-ant-api") && value.len() >= 40 && token_chars(value) {
+                Ok(())
+            } else {
+                Err("That doesn't look like a Claude API key. Claude API keys start with sk-ant-api.".to_string())
+            }
+        }
+        "openai_api_key" => {
+            if value.starts_with("sk-admin-") {
+                Err("That is an OpenAI admin key, which cannot run models. Use a project or user API key.".to_string())
+            } else if value.starts_with("sk-") && value.len() >= 40 && token_chars(value) {
+                Ok(())
+            } else {
+                Err("That doesn't look like an OpenAI API key. OpenAI API keys start with sk-.".to_string())
+            }
+        }
+        "elsevier_api_key" | "elsevier_institution_token" => {
+            if (16..=128).contains(&value.len()) && value.chars().all(|c| c.is_ascii_alphanumeric()) {
+                Ok(())
+            } else {
+                Err("That doesn't look like an Elsevier key or token (letters and digits only).".to_string())
+            }
+        }
+        "wiley_tdm_token" => {
+            if (32..=64).contains(&value.len())
+                && value.chars().all(|c| c.is_ascii_hexdigit() || c == '-')
+            {
+                Ok(())
+            } else {
+                Err("That doesn't look like a Wiley TDM client token (hexadecimal, usually a UUID).".to_string())
+            }
+        }
+        "library_proxy_prefix" => match Url::parse(value) {
+            Ok(url)
+                if url.scheme() == "https"
+                    && url.host_str().is_some()
+                    && url.username().is_empty()
+                    && url.password().is_none() =>
+            {
+                Ok(())
+            }
+            _ => Err("The library proxy prefix must be an https:// address without a username or password.".to_string()),
+        },
+        _ => Ok(()),
+    }
+}
+
 pub fn redact_secret(text: &str, secret: &str) -> String {
     let trimmed = secret.trim();
     if trimmed.is_empty() {
@@ -372,6 +429,15 @@ impl ModelVendor {
             ModelVendor::Anthropic => "Claude (Anthropic)",
             ModelVendor::OpenAi => "OpenAI",
             ModelVendor::ChatGpt => "ChatGPT plan",
+        }
+    }
+
+    /// The Keychain account holding this provider's API key; `None` for the ChatGPT plan.
+    pub fn api_key_account(&self) -> Option<&'static str> {
+        match self {
+            ModelVendor::Anthropic => Some("anthropic_api_key"),
+            ModelVendor::OpenAi => Some("openai_api_key"),
+            ModelVendor::ChatGpt => None,
         }
     }
 

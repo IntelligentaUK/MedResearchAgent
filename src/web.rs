@@ -12,8 +12,8 @@ use crate::models::{
     InstitutionalAccess, LibrarySnapshot, Paper, ResearchDomain, ResearchError,
 };
 use crate::providers::{
-    ChatGptPlanProvider, ClaudeProvider, KeychainStore, ModelOption, ModelVendor,
-    OpenAiProvider, SecretBackend,
+    check_credential_format, ChatGptPlanProvider, ClaudeProvider, KeychainStore, ModelOption,
+    ModelVendor, OpenAiProvider, SecretBackend,
 };
 use crate::report::ResearchReportBuilder;
 use crate::store::LibraryStore;
@@ -243,18 +243,21 @@ async fn index_handler(
     }
 
     let section = query.section.as_deref().unwrap_or("loop");
-    let flash = state.take_flash().await;
-    let lib = state.library.read().await;
-    let access = state.keychain.institutional_access();
-    let has_claude_key = state.keychain.get("anthropic_api_key").is_some();
-    let has_openai_key = state.keychain.get("openai_api_key").is_some();
-    let chatgpt = state.chatgpt.status().await;
-
+    // Built before taking the library lock: listing models can wait on the network.
     let model_picker = if is_loop_section(section) {
         render_model_picker(&state).await
     } else {
         String::new()
     };
+    let mut messages = state.models.take_notices();
+    messages.extend(state.take_flash().await);
+    let flash = (!messages.is_empty()).then(|| messages.join(" "));
+    let access = state.keychain.institutional_access();
+    let has_claude_key = state.keychain.get("anthropic_api_key").is_some();
+    let has_openai_key = state.keychain.get("openai_api_key").is_some();
+    let chatgpt = state.chatgpt.status().await;
+    let jobs = state.jobs.all_latest();
+    let lib = state.library.read().await;
 
     Html(render_workspace(
         &lib,
@@ -267,7 +270,7 @@ async fn index_handler(
         &chatgpt,
         state.keychain.backend(),
         &model_picker,
-        state.jobs.latest().as_ref(),
+        &jobs,
     ))
 }
 
@@ -671,20 +674,29 @@ async fn select_model(
             })
         }
         ModelVendor::Anthropic | ModelVendor::OpenAi => {
-            let key = match vendor {
-                ModelVendor::OpenAi => state.keychain.get("openai_api_key"),
-                _ => state.keychain.get("anthropic_api_key"),
-            }
-            .unwrap_or_default();
+            let key = vendor
+                .api_key_account()
+                .and_then(|account| state.keychain.get(account))
+                .unwrap_or_default();
+            let app = Arc::clone(state);
             Box::new(move |sys, prompt| {
                 let k = key.clone();
                 let m = m.clone();
+                let app = Arc::clone(&app);
                 Box::pin(async move {
-                    match vendor {
+                    let result = match vendor {
                         ModelVendor::OpenAi => {
                             OpenAiProvider::default().generate(&k, &m, &sys, &prompt).await
                         }
                         _ => ClaudeProvider::default().generate(&k, &m, &sys, &prompt).await,
+                    };
+                    match result {
+                        Err(ResearchError::Http(401, _)) => Err(ResearchError::Unavailable(
+                            app.models
+                                .forget_rejected_key(&app.keychain, vendor, &k)
+                                .await,
+                        )),
+                        other => other,
                     }
                 })
             })
@@ -893,29 +905,30 @@ async fn run_discovery_handler(
         }
     };
     let requested_objective = form.objective.clone().filter(|s| !s.trim().is_empty());
+    let domain = state.library.read().await.pipeline.settings.domain();
     let app = Arc::clone(&state);
     let title = format!("Discovery cycle · {}", selection.model);
-    let started = state.jobs.start(title, "cycles", move |progress| async move {
+    let started = state.jobs.start(domain, title, "cycles", move |progress| async move {
         let ModelSelection {
             vendor,
             model,
             generate,
         } = selection;
-        let (domain, prev_statements, objective) = {
+        let (prev_statements, objective) = {
             let mut lib = app.library.write().await;
             lib.pipeline
                 .reserve_model_request(Utc::now())
                 .map_err(|e| format!("Cannot start discovery: {e}"))?;
-            let d = lib.pipeline.settings.domain();
             let prev: Vec<String> = lib
                 .pipeline
                 .queue
                 .iter()
-                .filter(|q| q.domain() == d)
+                .filter(|q| q.domain() == domain)
                 .map(|q| q.draft.statement.clone())
                 .collect();
-            let obj = requested_objective.or_else(|| lib.pipeline.objectives(d).into_iter().next());
-            (d, prev, obj)
+            let obj = requested_objective
+                .or_else(|| lib.pipeline.objectives(domain).into_iter().next());
+            (prev, obj)
         };
         progress.report(format!("Using {} · {model}", vendor.display_name()));
         let access = app.keychain.institutional_access();
@@ -992,13 +1005,13 @@ async fn run_validation_handler(
         "Validation · {}",
         target_item.draft.title.chars().take(80).collect::<String>()
     );
-    let started = state.jobs.start(title, "validations", move |progress| async move {
+    let domain = target_item.domain();
+    let started = state.jobs.start(domain, title, "validations", move |progress| async move {
         let ModelSelection {
             vendor,
             model,
             generate,
         } = selection;
-        let domain = target_item.domain();
         let supplied_papers = {
             let mut lib = app.library.write().await;
             lib.pipeline
@@ -1055,26 +1068,25 @@ async fn run_connection_handler(
             return Redirect::to(&back_to(&headers, "connections")).into_response();
         }
     };
+    let domain = state.library.read().await.pipeline.settings.domain();
     let app = Arc::clone(&state);
     let title = format!("Connection review · {}", selection.model);
-    let started = state.jobs.start(title, "connections", move |progress| async move {
+    let started = state.jobs.start(domain, title, "connections", move |progress| async move {
         let ModelSelection {
             vendor,
             model,
             generate,
         } = selection;
-        let (items, validations, papers, offset, domain) = {
+        let (items, validations, papers, offset) = {
             let mut lib = app.library.write().await;
             lib.pipeline
                 .reserve_model_request(Utc::now())
                 .map_err(|e| format!("Cannot start connection review: {e}"))?;
-            let d = lib.pipeline.settings.domain();
             (
                 lib.pipeline.queue.clone(),
                 lib.pipeline.validations.clone(),
-                lib.research_papers(d),
+                lib.research_papers(domain),
                 lib.pipeline.connections.len(),
-                d,
             )
         };
         progress.report(format!("Using {} · {model}", vendor.display_name()));
@@ -1130,7 +1142,7 @@ async fn events_handler(
     });
     let snapshot = Event::default()
         .event("snapshot")
-        .json_data(state.jobs.latest())
+        .json_data(state.jobs.all_latest())
         .unwrap_or_else(|_| Event::default().event("snapshot").data("null"));
     Sse::new(tokio_stream::once(Ok(snapshot)).chain(updates)).keep_alive(KeepAlive::default())
 }
@@ -1161,31 +1173,57 @@ async fn save_credentials_handler(
     if !verify_csrf(&state.csrf_token, &form.csrf_token) {
         return (StatusCode::FORBIDDEN, "Invalid CSRF token").into_response();
     }
+    // Blank fields keep the saved value; filled-in fields are saved only if they look like
+    // the credential that field expects.
+    let mut rejected = Vec::new();
+    let mut accepted = 0;
+    let mut accept = |label: &str, account: &str, value: Option<String>| -> Option<String> {
+        let value = value
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())?;
+        match check_credential_format(account, &value) {
+            Ok(()) => {
+                accepted += 1;
+                Some(value)
+            }
+            Err(why) => {
+                rejected.push(format!("{label} not saved: {why}"));
+                None
+            }
+        }
+    };
+    let anthropic = accept("Claude API key", "anthropic_api_key", form.anthropic_api_key);
+    let openai = accept("OpenAI API key", "openai_api_key", form.openai_api_key);
+    let elsevier = accept("Elsevier API key", "elsevier_api_key", form.elsevier_api_key);
+    let insttoken = accept(
+        "Elsevier institution token",
+        "elsevier_institution_token",
+        form.elsevier_institution_token,
+    );
+    let wiley = accept("Wiley TDM token", "wiley_tdm_token", form.wiley_tdm_token);
+    let proxy = accept(
+        "Library proxy prefix",
+        "library_proxy_prefix",
+        form.library_proxy_prefix,
+    );
+
     let mut failures = Vec::new();
-    if let Some(ref k) = form.anthropic_api_key {
-        if !k.trim().is_empty() && state.keychain.set("anthropic_api_key", k).is_err() {
+    if let Some(k) = anthropic {
+        if state.keychain.set("anthropic_api_key", &k).is_err() {
             failures.push("Claude API key");
         }
     }
-    if let Some(ref k) = form.openai_api_key {
-        if !k.trim().is_empty() && state.keychain.set("openai_api_key", k).is_err() {
+    if let Some(k) = openai {
+        if state.keychain.set("openai_api_key", &k).is_err() {
             failures.push("OpenAI API key");
         }
     }
     let current = state.keychain.institutional_access();
     let updated = InstitutionalAccess::new(
-        form.elsevier_api_key
-            .filter(|s| !s.trim().is_empty())
-            .or(current.elsevier_api_key),
-        form.elsevier_institution_token
-            .filter(|s| !s.trim().is_empty())
-            .or(current.elsevier_institution_token),
-        form.wiley_tdm_token
-            .filter(|s| !s.trim().is_empty())
-            .or(current.wiley_tdm_token),
-        form.library_proxy_prefix
-            .filter(|s| !s.trim().is_empty())
-            .or(current.library_proxy_prefix),
+        elsevier.or(current.elsevier_api_key),
+        insttoken.or(current.elsevier_institution_token),
+        wiley.or(current.wiley_tdm_token),
+        proxy.or(current.library_proxy_prefix),
     );
     if state.keychain.save_institutional_access(&updated).is_err() {
         failures.push("institutional access settings");
@@ -1195,16 +1233,19 @@ async fn save_credentials_handler(
         .invalidate(&[ModelVendor::Anthropic, ModelVendor::OpenAi])
         .await;
     let store = state.keychain.backend().describe();
-    let flash = if failures.is_empty() {
-        format!("Credentials saved to {store}.")
-    } else {
-        format!(
+    let mut messages = rejected;
+    if !failures.is_empty() {
+        messages.push(format!(
             "{} did not save: {}. Check that it is unlocked and available.",
             capitalize(&store),
             failures.join(", ")
-        )
-    };
-    state.set_flash(flash).await;
+        ));
+    } else if accepted > 0 {
+        messages.push(format!("Credentials saved to {store}."));
+    } else if messages.is_empty() {
+        messages.push("Nothing to save: every field was left blank.".to_string());
+    }
+    state.set_flash(messages.join(" ")).await;
     Redirect::to("/?section=sources").into_response()
 }
 
@@ -1321,7 +1362,7 @@ fn render_workspace(
     chatgpt: &ChatGptStatus,
     secret_store: &SecretBackend,
     model_picker: &str,
-    job: Option<&JobSnapshot>,
+    jobs: &[JobSnapshot],
 ) -> String {
     let domain = lib.pipeline.settings.domain();
     let domain_papers = lib.research_papers(domain);
@@ -1418,7 +1459,12 @@ fn render_workspace(
         String::new()
     };
 
-    let job_panel = render_job_panel(job);
+    let job = jobs.iter().find(|j| j.domain == domain);
+    let others_running: Vec<&JobSnapshot> = jobs
+        .iter()
+        .filter(|j| j.domain != domain && j.status == JobStatus::Running)
+        .collect();
+    let job_panel = render_job_panel(job, &others_running);
     let job_running = job.is_some_and(|j| j.status == JobStatus::Running);
 
     let csrf_escaped = html_escape(csrf_token);
@@ -1443,7 +1489,7 @@ fn render_workspace(
   <link rel="stylesheet" href="/static/app.css">
   <script src="/static/app.js" defer></script>
 </head>
-<body data-job-running="{job_running}">
+<body data-job-running="{job_running}" data-domain="{}">
   <div class="layout">
     <aside class="sidebar">
       <div class="brand">
@@ -1484,15 +1530,29 @@ fn render_workspace(
 </body>
 </html>"#,
         html_escape(domain.display_name()),
+        domain.as_str(),
         html_escape(section)
     )
 }
 
 /// The activity panel for the latest research stage. `static/app.js` keeps it live; this
 /// server-rendered copy is what a page shows on load (and without JavaScript).
-fn render_job_panel(job: Option<&JobSnapshot>) -> String {
+fn render_job_panel(job: Option<&JobSnapshot>, others_running: &[&JobSnapshot]) -> String {
+    let others: String = others_running
+        .iter()
+        .map(|other| {
+            format!(
+                r#"<p class="caption">{} research is running: {}</p>"#,
+                html_escape(&other.field),
+                html_escape(&other.title)
+            )
+        })
+        .collect();
+    let others_html = format!(r#"<div id="job-others">{others}</div>"#);
     let Some(job) = job else {
-        return r#"<section id="job-panel" class="card job-panel" hidden></section>"#.to_string();
+        return format!(
+            r#"{others_html}<section id="job-panel" class="card job-panel" hidden></section>"#
+        );
     };
     let (status, pill, label) = match job.status {
         JobStatus::Running => ("running", "pill-warn", "Running"),
@@ -1528,7 +1588,7 @@ fn render_job_panel(job: Option<&JobSnapshot>) -> String {
         )
     };
     format!(
-        r#"<section id="job-panel" class="card job-panel" data-job-id="{}" data-status="{status}">
+        r#"{others_html}<section id="job-panel" class="card job-panel" data-job-id="{}" data-status="{status}">
         <div class="row-between"><h3>{}</h3><span class="pill {pill}">{label}</span></div>
         {outcome}
         <ol class="job-log">{lines}</ol>
@@ -2154,7 +2214,7 @@ body {
 }
 .layout {
   display: grid;
-  grid-template-columns: 280px 1fr;
+  grid-template-columns: 280px minmax(0, 1fr);
   min-height: 100vh;
 }
 .sidebar {
@@ -2278,7 +2338,10 @@ const WORKSPACE_JS: &str = r##""use strict";
   if (!("EventSource" in window)) return;
   const LABELS = { running: "Running", succeeded: "Completed", failed: "Failed" };
   const PILLS = { running: "pill-warn", succeeded: "pill-ok", failed: "pill-error" };
-  let job = null;
+  // Latest job per research field ("dementia", "cancer").
+  let jobs = {};
+  const currentDomain = () => document.body.dataset.domain;
+  const currentJob = () => jobs[currentDomain()] || null;
 
   const el = (tag, className, text) => {
     const node = document.createElement(tag);
@@ -2294,12 +2357,24 @@ const WORKSPACE_JS: &str = r##""use strict";
     return item;
   };
 
+  function renderOthers() {
+    const others = document.getElementById("job-others");
+    if (!others) return;
+    const notes = Object.values(jobs)
+      .filter((job) => job.domain !== currentDomain() && job.status === "running")
+      .map((job) => el("p", "caption", job.field + " research is running: " + job.title));
+    others.replaceChildren(...notes);
+  }
+
   function render() {
+    const job = currentJob();
     document.body.dataset.jobRunning = String(job !== null && job.status === "running");
+    renderOthers();
     const panel = document.getElementById("job-panel");
     if (!panel) return;
     if (!job) {
       panel.hidden = true;
+      panel.replaceChildren();
       return;
     }
     panel.hidden = false;
@@ -2324,8 +2399,10 @@ const WORKSPACE_JS: &str = r##""use strict";
   }
 
   function appendLine(update) {
+    const job = jobs[update.domain];
     if (!job || job.id !== update.id) return;
     job.log.push(update.line);
+    if (update.domain !== currentDomain()) return;
     const log = document.querySelector("#job-panel .job-log");
     if (!log) return render();
     const atBottom = log.scrollHeight - log.scrollTop - log.clientHeight < 40;
@@ -2342,6 +2419,11 @@ const WORKSPACE_JS: &str = r##""use strict";
       const response = await fetch(location.href, { headers: { Accept: "text/html" }, cache: "no-store" });
       if (!response.ok) return;
       const page = new DOMParser().parseFromString(await response.text(), "text/html");
+      // The field may have been switched in another tab; reload fully if so.
+      if (page.body.dataset.domain !== currentDomain()) {
+        location.reload();
+        return;
+      }
       for (const selector of ["main.content", "aside.sidebar nav"]) {
         const fresh = page.querySelector(selector);
         const current = document.querySelector(selector);
@@ -2356,21 +2438,27 @@ const WORKSPACE_JS: &str = r##""use strict";
   const source = new EventSource("/events");
   const read = (event) => JSON.parse(event.data);
   source.addEventListener("snapshot", (event) => {
-    const wasRunning = job !== null && job.status === "running";
-    job = read(event);
+    const before = currentJob();
+    jobs = {};
+    for (const job of read(event) || []) jobs[job.domain] = job;
     render();
-    // Reconnected after the stage finished while the connection was down.
-    if (wasRunning && job && job.status !== "running") refreshContent();
+    // Reconnected after this field's stage finished while the connection was down.
+    const after = currentJob();
+    if (before && before.status === "running" && after && after.id === before.id && after.status !== "running") {
+      refreshContent();
+    }
   });
   source.addEventListener("started", (event) => {
-    job = read(event).job;
+    const job = read(event).job;
+    jobs[job.domain] = job;
     render();
   });
   source.addEventListener("progress", (event) => appendLine(read(event)));
   source.addEventListener("finished", (event) => {
-    job = read(event).job;
+    const job = read(event).job;
+    jobs[job.domain] = job;
     render();
-    refreshContent();
+    if (job.domain === currentDomain()) refreshContent();
   });
 })();
 "##;
